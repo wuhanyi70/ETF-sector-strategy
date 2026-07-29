@@ -426,3 +426,15 @@ if __name__ == "__main__":
 
     print("\nMissing values by column:")
     print(master_data.isna().sum())
+
+    master_output_path = (
+        PROCESSED_DATA_DIR / "master_dataset.parquet"
+    )
+
+    master_data.to_parquet(
+        master_output_path,
+        index=False,
+        engine="pyarrow",
+    )
+
+    print(f"\nSaved processed dataset to: {master_output_path}")
