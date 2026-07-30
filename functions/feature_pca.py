@@ -12,7 +12,7 @@ features actually contain, and which features cluster together?
 Tasks:
 1. Load the feature dataset.
 2. Select numeric feature columns (exclude identifiers, raw prices,
-   and the target).
+   and both candidate targets).
 3. Standardize features (required before PCA — unequal scales would
    otherwise dominate the components).
 4. Run PCA and report explained variance, cumulative variance, and
@@ -38,9 +38,10 @@ FEATURE_DATA_PATH = PROCESSED_DATA_DIR / "feature_dataset.parquet"
 
 # =============================================================================
 # Columns to exclude from the PCA test
-# (identifiers, raw price levels, and the target are not "features"
-# in the modeling sense — including raw prices would also dominate
-# the PCA purely due to scale/trend, not genuine feature redundancy)
+# (identifiers, raw price levels, and both candidate targets are not
+# "features" in the modeling sense — including raw prices would also
+# dominate the PCA purely due to scale/trend, not genuine feature
+# redundancy)
 # =============================================================================
 
 EXCLUDE_COLUMNS = [
@@ -54,7 +55,8 @@ EXCLUDE_COLUMNS = [
     "Volume",
     "SPY",
     "daily_return",
-    "target_5d_forward_return",
+    "target_5d_forward_return_raw",
+    "target_5d_forward_return_excess_spy",
 ]
 
 
