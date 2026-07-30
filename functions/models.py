@@ -1,977 +1,1137 @@
-
 """
-Modeling pipeline for the ETF Sector Rotation project (Day 3 / Day 4).
- 
-Pipeline stages, in the order this file runs them:
-    1. Load the feature dataset and document the feature set (internal vs.
-       external, tagged with a Day 3 risk-model bucket).
-    2. Standardize features point-in-time-safely (cross-sectional z-score
-       for internal features, causal expanding z-score for external/macro
-       features).
-    3. Build embargoed walk-forward (expanding-window) CV splits.
-    4. Fit two baselines (no-skill, naive momentum) as a reference point.
-    5. Step 1 — feature clustering: flag redundant internal features via
-       their pairwise correlation, and define a reduced feature set.
-    6. Fit the two required models (Elastic Net, LightGBM), POOLED across
-       all 11 ETFs, on both the full and reduced feature sets.
-    7. Step 2 — pooled vs. specialized: refit both models one-ETF-at-a-time
-       and compare against the pooled result.
-    8. Evaluate everything with the same metric suite: time-series IC
-       (primary, per Day 1/3's small-N guidance), hit rate corrected for
-       the target's own base rate, and cross-sectional IC (secondary).
- 
-Modeling decisions, documented rather than hidden:
- 
-    POOLED vs. SPECIALIZED — pooling the 11 ETFs into one training set is
-    a real assumption, not a free default: they have genuinely different
-    macro sensitivities. Both are fit and compared (Step 2) rather than
-    picking one without evidence.
- 
-    SMALL-N IC CAVEAT — cross-sectional Rank IC is computed across only 11
-    instruments per date, which is far noisier than the same statistic
-    across hundreds of names. Time-series IC (per ETF, across ~1700+
-    dates) is reported as the PRIMARY metric instead; cross-sectional IC
-    is kept as a secondary diagnostic, with its coverage reported
-    explicitly since it can become mathematically undefined when a model
-    predicts near-identical scores for every ETF on a date.
- 
-    HIT RATE BASE RATE — a hit rate is only informative relative to the
-    rate a trivial "always predict the majority sign" rule would already
-    achieve. The model uses sector-relative forward returns, whose daily
-    cross-sectional mean is approximately zero, so sign accuracy measures
-    relative outperformance rather than broad market direction.
+Modeling pipeline for the ETF Sector Rotation project.
 
-    LIGHTGBM: FIXED TREE COUNT, NOT EARLY STOPPING — validation-based early
-    stopping (a held-out tail slice of the training dates) was tried first
-    and abandoned: across the 5 walk-forward folds, best_iteration_ landed
-    at {4, 1, 67, 1, 1} — 4 of 5 folds effectively trained a single tree
-    before giving up, because the validation slice is small and the
-    per-round change in loss is dominated by noise rather than genuine
-    over/underfitting. A fixed tree count (n_estimators=300, matched to
-    the num_leaves/min_child_samples regularization already in place) is
-    far more reproducible across folds, at the cost of not adapting tree
-    count to how much data each fold happens to have.
+This version is aligned with the current functions/features.py and
+functions/feature_pca.py, and folds in a round of code review:
+
+- Imports SELECTED_FEATURES and TARGET_COLUMNS from feature_pca.py.
+- Uses both current targets:
+    * target_5d_forward_return_raw
+    * target_5d_forward_return_excess_spy
+- Automatically detects date-shared versus ETF-varying features from the
+  constructed dataset, then applies the appropriate point-in-time scaling.
+- Compares pooled and specialized Elastic Net / LightGBM models.
+- Pooled models now get an ETF fixed effect (dummy variables for Elastic
+  Net, a categorical feature for LightGBM). Internal features are already
+  z-scored within each date's cross-section, so on their own a pooled
+  model can only express "how does this ETF compare to its peers TODAY" --
+  it had no way to express "this sector structurally outperforms," which
+  is exactly what let historical_mean and the specialized (per-ETF)
+  models beat pooled Elastic Net/LightGBM on Hit@1 in the earlier run.
+- Tunes Elastic Net using true date-level cross-sectional IC (pooled) or
+  time-series rank IC (specialized, where cross-sectional IC is
+  undefined for a single ETF).
+- Evaluates daily cross-sectional IC with a Newey-West/HAC t-stat, BOTH
+  pooled across all outer folds (model_evaluation.csv) and broken out
+  fold-by-fold (model_evaluation_by_fold.csv) -- a pooled-only summary
+  can hide a result that is really concentrated in one or two folds.
+- Reports an overall sign hit rate, Hit@1 and Hit@3, each with skill vs.
+  its correct baseline -- majority-sign for the overall hit rate, and
+  K / n_ETFs random selection for Hit@K, NOT 50%, which is only the
+  right null for a balanced binary sign call.
+- LightGBM is fit on a more lenient train/test frame that only requires
+  a non-null target (LightGBM handles missing features natively), so it
+  no longer loses rows to Elastic Net's complete-case requirement --
+  most relevant during the walk-forward warm-up window when long-lookback
+  features (e.g. the 60-day rolling features) are still NaN.
+- Quiet by default: progress/diagnostic prints are gated behind
+  ModelConfig.verbose (main(verbose=True) to restore full logging). The
+  saved CSVs are unaffected either way.
+- Saves one prediction file, one pooled-across-folds evaluation file, one
+  per-fold evaluation file, and the coefficient / importance diagnostics.
 """
- 
-from dataclasses import dataclass
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
 from pathlib import Path
- 
+
 import lightgbm as lgb
 import numpy as np
 import pandas as pd
-from sklearn.linear_model import ElasticNetCV
-from sklearn.model_selection import TimeSeriesSplit
- 
- 
+from scipy.stats import spearmanr
+from sklearn.base import clone
+from sklearn.impute import SimpleImputer
+from sklearn.linear_model import ElasticNet
+from sklearn.model_selection import ParameterGrid
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+
+from feature_pca import SELECTED_FEATURES, TARGET_COLUMNS
+
+import warnings
+from sklearn.exceptions import ConvergenceWarning
+
+warnings.filterwarnings(
+    "ignore",
+    category=ConvergenceWarning
+)
+warnings.filterwarnings(
+    "ignore",
+    category=RuntimeWarning
+)
 # =============================================================================
-# Project folders
+# Paths and columns
 # =============================================================================
- 
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-PROCESSED_DATA_DIR = PROJECT_ROOT / "data" / "processed"
-FEATURE_DATA_PATH = PROCESSED_DATA_DIR / "feature_dataset.parquet"
- 
- 
-# =============================================================================
-# Config
-# =============================================================================
- 
-# Must match features.py's add_target_variable() horizon.
-TARGET_HORIZON_DAYS = 5
- 
-# The target at date t uses the close price at t + TARGET_HORIZON_DAYS, so
-# any training row within that many days of a split boundary has a label
-# window overlapping the other side of the boundary. The embargo drops
-# those rows from the training side of every split — the main walk-forward
-# splits below AND the inner CV folds used to tune Elastic Net.
-EMBARGO_DAYS = TARGET_HORIZON_DAYS
- 
-ENTITY_COL = "ETF"
+FEATURE_DATA_PATH = PROJECT_ROOT / "data" / "processed" / "feature_dataset.parquet"
+MODEL_OUTPUT_DIR = PROJECT_ROOT / "data" / "model_outputs"
+
 DATE_COL = "Date"
-TARGET_COL = f"target_{TARGET_HORIZON_DAYS}d_relative_return"
- 
-# Full feature set, tagged (scope, Day 3 risk-model bucket) — the Day 3
-# feature-documentation deliverable.
-FEATURE_GROUPS = {
-    "return_5d": ("internal", "fundamental (momentum)"),
-    "return_20d": ("internal", "fundamental (momentum)"),
-    "return_60d": ("internal", "fundamental (momentum)"),
-    "price_to_MA20": ("internal", "technical (trend)"),
-    "price_to_MA50": ("internal", "technical (trend)"),
-    "MA20_minus_MA50": ("internal", "technical (trend)"),
-    "RSI_14": ("internal", "technical (momentum oscillator)"),
-    "MACD": ("internal", "technical (momentum oscillator)"),
-    "volatility_20d": ("internal", "statistical (risk)"),
-    "max_drawdown_60d": ("internal", "statistical (risk)"),
-    "volume_change": ("internal", "statistical (trading activity)"),
-    "relative_volume": ("internal", "statistical (trading activity)"),
-    "VIX": ("external", "macro (sentiment / vol)"),
-    "Treasury_10Y": ("external", "macro (rates)"),
-    "Yield_Spread_10Y2Y": ("external", "macro (rates)"),
-    "Federal_Funds_Rate": ("external", "macro (rates)"),
-    "CPI": ("external", "macro (cycle)"),
-    "Unemployment_Rate": ("external", "macro (cycle)"),
-}
- 
-INTERNAL_FEATURE_COLS = [
-    name for name, (scope, _) in FEATURE_GROUPS.items() if scope == "internal"
-]
-EXTERNAL_FEATURE_COLS = [
-    name for name, (scope, _) in FEATURE_GROUPS.items() if scope == "external"
-]
- 
-# Step 1 payoff (see compute_feature_correlation_matrix / the Step 1 block
-# in __main__): 5 of the 12 internal features form one heavily redundant
-# "trend/momentum-derivative" cluster (pairwise Spearman corr 0.72-0.90) —
-# price_to_MA20, price_to_MA50, MA20_minus_MA50, RSI_14, MACD are all
-# smoothed re-readings of the momentum signal already in the three raw
-# return_Xd features. Dropping them keeps one clean representative per
-# horizon instead of 8 near-duplicates. volatility_20d/max_drawdown_60d
-# (corr -0.63) and volume_change/relative_volume (corr 0.50) are
-# correlated but not redundant enough to collapse further.
-REDUCED_INTERNAL_FEATURE_COLS = [
-    "return_5d",
-    "return_20d",
-    "return_60d",
-    "volatility_20d",
-    "max_drawdown_60d",
-    "volume_change",
-    "relative_volume",
-]
- 
- 
+ETF_COL = "ETF"
+TARGET_HORIZON_DAYS = 5
+
+FEATURE_COLUMNS = list(SELECTED_FEATURES)
+TARGET_COLUMNS = list(TARGET_COLUMNS)
+
+# The feature names are maintained only in feature_pca.py. The modeling
+# pipeline does not duplicate them or manually label macro/ETF features.
+# Instead, it inspects the actual feature dataset:
+#   - date-shared feature: one value across all ETFs on a date
+#   - cross-sectional feature: values vary across ETFs on at least one date
+# This correctly treats rate_sensitivity_beta as cross-sectional because
+# features.py estimates it separately for each ETF.
+STANDARDIZED_FEATURE_COLUMNS = [f"z_{feature}" for feature in FEATURE_COLUMNS]
+
+
 # =============================================================================
-# Feature standardization
+# Configuration and result containers
 # =============================================================================
- 
-def add_cross_sectional_zscores(
-    df: pd.DataFrame,
-    cols: list[str],
-    date_col: str = DATE_COL,
-) -> pd.DataFrame:
-    """
-    Standardize internal/asset-specific features within each date's own
-    cross-section (across the 11 ETFs that day) — "is this ETF extreme
-    relative to its peers today," and a scale-free way to compare features
-    like MACD that are naturally larger for a higher-priced ETF.
-    """
- 
-    df = df.copy()
-    grouped = df.groupby(date_col)[cols]
-    mean = grouped.transform("mean")
-    std = grouped.transform("std").replace(0, np.nan)
- 
-    for col in cols:
-        df[f"z_{col}"] = (df[col] - mean[col]) / std[col]
- 
-    return df
- 
- 
-def add_expanding_zscores(
-    df: pd.DataFrame,
-    cols: list[str],
-    date_col: str = DATE_COL,
-    min_periods: int = 60,
-) -> pd.DataFrame:
-    """
-    Standardize external/macro features using only PAST history up to each
-    date (expanding window) — every ETF shares the same macro value on a
-    given date, so a cross-sectional z-score would divide by zero. Causal
-    by construction: the z-score on date t only ever uses rows with
-    date <= t.
-    """
- 
-    df = df.copy()
-    daily = (
-        df.drop_duplicates(subset=date_col)[[date_col] + cols]
-        .sort_values(date_col)
-        .set_index(date_col)
-    )
- 
-    expanding_mean = daily.expanding(min_periods=min_periods).mean()
-    expanding_std = daily.expanding(min_periods=min_periods).std().replace(0, np.nan)
- 
-    z = (daily - expanding_mean) / expanding_std
-    z.columns = [f"z_{c}" for c in cols]
-    z = z.reset_index()
- 
-    return df.merge(z, on=date_col, how="left")
- 
- 
-# =============================================================================
-# Step 1: feature clustering / multicollinearity diagnostics
-# =============================================================================
- 
-def compute_feature_correlation_matrix(
-    df: pd.DataFrame,
-    cols: list[str],
-    method: str = "spearman",
-) -> pd.DataFrame:
-    """Pairwise correlation across the pooled panel — Spearman to match
-    the rank-based IC metrics used elsewhere."""
- 
-    return df[cols].corr(method=method)
- 
- 
-def print_high_correlation_pairs(corr: pd.DataFrame, threshold: float = 0.7) -> None:
-    """Flag feature pairs redundant enough to be a multicollinearity
-    concern for the linear model."""
- 
-    cols = corr.columns.tolist()
-    print(f"\nFeature pairs with |Spearman corr| > {threshold}:")
-    for i, a in enumerate(cols):
-        for b in cols[i + 1:]:
-            c = corr.loc[a, b]
-            if abs(c) > threshold:
-                print(f"  {a:20s} {b:20s} {c:+.3f}")
- 
- 
-# =============================================================================
-# Walk-forward split generation
-# =============================================================================
- 
+
+@dataclass
+class ModelConfig:
+    n_outer_splits: int = 5
+    n_inner_splits: int = 3
+    embargo_periods: int = TARGET_HORIZON_DAYS
+    random_state: int = 42
+    n_jobs: int = -1
+    min_specialized_train_rows: int = 150
+    verbose: bool = False
+    # Populated in main() from the actual dataset so pooled models always
+    # see the same, fixed set of ETF dummy/categorical levels regardless
+    # of which subset of ETFs happens to appear in a given fold.
+    entity_categories: list[str] = field(default_factory=list)
+
+
 @dataclass
 class WalkForwardSplit:
     split_id: int
     train_dates: pd.DatetimeIndex
     test_dates: pd.DatetimeIndex
- 
- 
-def generate_walk_forward_splits(
-    dates: pd.Series,
-    n_splits: int,
-    min_train_periods: int,
-    embargo_days: int = EMBARGO_DAYS,
-) -> list[WalkForwardSplit]:
-    """
-    Expanding-window walk-forward CV with an embargo gap. Fold 0 trains on
-    the earliest `min_train_periods` trading days and tests on the block
-    right after (minus the embargo); each later fold expands the training
-    window forward in time — never shuffled, never using a date the model
-    wouldn't have known about yet.
-    """
- 
-    unique_dates = pd.DatetimeIndex(sorted(pd.unique(dates)))
-    n_dates = len(unique_dates)
- 
-    if n_dates <= min_train_periods:
-        raise ValueError("Not enough unique trading dates for one walk-forward split.")
- 
-    test_block_size = (n_dates - min_train_periods) // n_splits
-    if test_block_size <= embargo_days:
-        raise ValueError("Test block too small relative to the embargo.")
- 
-    splits = []
-    for split_id in range(n_splits):
-        test_start_idx = min_train_periods + split_id * test_block_size
-        is_last_split = split_id == n_splits - 1
-        test_end_idx = n_dates if is_last_split else test_start_idx + test_block_size
- 
-        test_dates = unique_dates[test_start_idx:test_end_idx]
-        train_end_idx = test_start_idx - embargo_days
- 
-        if train_end_idx <= 0:
-            raise ValueError(f"Split {split_id}: embargo consumes the entire training window.")
- 
-        train_dates = unique_dates[:train_end_idx]
-        splits.append(WalkForwardSplit(split_id, train_dates, test_dates))
- 
-    return splits
- 
- 
-def apply_split(
+    train_index: np.ndarray
+    test_index: np.ndarray
+
+
+ELASTIC_NET_PARAM_GRID = {
+    "model__alpha": [1e-5, 1e-4, 1e-3, 1e-2, 1e-1],
+    "model__l1_ratio": [0.1, 0.3, 0.5, 0.7, 0.9, 1.0],
+}
+
+
+# =============================================================================
+# Data preparation
+# =============================================================================
+
+def load_feature_dataset(file_path: Path = FEATURE_DATA_PATH) -> pd.DataFrame:
+    if not file_path.exists():
+        raise FileNotFoundError(
+            f"Feature dataset not found at {file_path}. Run functions/features.py first."
+        )
+
+    df = pd.read_parquet(file_path)
+    df[DATE_COL] = pd.to_datetime(df[DATE_COL], errors="raise")
+    return df.sort_values([DATE_COL, ETF_COL]).reset_index(drop=True)
+
+
+def validate_dataset(df: pd.DataFrame, verbose: bool = False) -> None:
+    required = [DATE_COL, ETF_COL] + FEATURE_COLUMNS + TARGET_COLUMNS
+    missing = [column for column in required if column not in df.columns]
+    if missing:
+        raise ValueError(
+            "The feature dataset is not aligned with the current feature_pca.py. "
+            f"Missing columns: {missing}"
+        )
+
+    duplicate_rows = df.duplicated([DATE_COL, ETF_COL]).sum()
+    if duplicate_rows:
+        raise ValueError(
+            f"Found {duplicate_rows} duplicate Date/ETF observations."
+        )
+
+    if verbose:
+        print("Dataset validation passed.")
+        print(f"  Selected features: {len(FEATURE_COLUMNS)}")
+        print(f"  Targets: {TARGET_COLUMNS}")
+
+
+def _safe_cross_sectional_zscore(values: pd.Series) -> pd.Series:
+    std = values.std(ddof=0)
+    if pd.isna(std) or np.isclose(std, 0.0):
+        return pd.Series(0.0, index=values.index)
+    return (values - values.mean()) / std
+
+
+def infer_feature_structure(
+    df: pd.DataFrame, verbose: bool = False
+) -> tuple[list[str], list[str]]:
+    """Infer preprocessing groups directly from the constructed dataset."""
+    date_shared: list[str] = []
+    cross_sectional: list[str] = []
+
+    for feature in FEATURE_COLUMNS:
+        # Ignore missing values when checking whether ETFs share the same
+        # value on each date. A feature is date-shared only when it never has
+        # more than one observed value across ETFs on any date.
+        max_values_per_date = df.groupby(DATE_COL)[feature].nunique(dropna=True).max()
+        if pd.isna(max_values_per_date) or max_values_per_date <= 1:
+            date_shared.append(feature)
+        else:
+            cross_sectional.append(feature)
+
+    if set(date_shared) | set(cross_sectional) != set(FEATURE_COLUMNS):
+        raise RuntimeError("Automatic feature classification was incomplete.")
+
+    if verbose:
+        print("\nAutomatically inferred feature structure:")
+        print(f"  Date-shared features ({len(date_shared)}): {date_shared}")
+        print(f"  Cross-sectional features ({len(cross_sectional)}): {cross_sectional}")
+
+    return date_shared, cross_sectional
+
+
+def standardize_cross_sectional_features(
     df: pd.DataFrame,
-    split: WalkForwardSplit,
-    date_col: str = DATE_COL,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Slice a long-format (Date, ETF, ...) panel into train/test frames."""
- 
-    train_df = df[df[date_col].isin(split.train_dates)].copy()
-    test_df = df[df[date_col].isin(split.test_dates)].copy()
-    return train_df, test_df
- 
- 
-def check_no_leakage(splits: list[WalkForwardSplit]) -> None:
-    """Assert no date appears in both the train and test side of any split."""
- 
+    feature_columns: list[str],
+) -> pd.DataFrame:
+    df = df.copy()
+    for feature in feature_columns:
+        df[f"z_{feature}"] = (
+            df.groupby(DATE_COL)[feature]
+            .transform(_safe_cross_sectional_zscore)
+        )
+    return df
+
+
+def standardize_date_shared_features(
+    df: pd.DataFrame,
+    feature_columns: list[str],
+) -> pd.DataFrame:
+    if not feature_columns:
+        return df.copy()
+
+    df = df.copy()
+    daily = (
+        df.groupby(DATE_COL, as_index=False)[feature_columns]
+        .first()
+        .sort_values(DATE_COL)
+        .reset_index(drop=True)
+    )
+
+    for feature in feature_columns:
+        # shift(1) prevents the current observation from influencing its own
+        # expanding mean and standard deviation.
+        expanding_mean = daily[feature].expanding().mean().shift(1)
+        expanding_std = daily[feature].expanding().std(ddof=0).shift(1)
+        daily[f"z_{feature}"] = (
+            (daily[feature] - expanding_mean) / expanding_std
+        ).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+    return df.merge(
+        daily[[DATE_COL] + [f"z_{f}" for f in feature_columns]],
+        on=DATE_COL,
+        how="left",
+        validate="many_to_one",
+    )
+
+
+def prepare_model_dataset(df: pd.DataFrame, verbose: bool = False) -> pd.DataFrame:
+    date_shared, cross_sectional = infer_feature_structure(df, verbose=verbose)
+    df = standardize_cross_sectional_features(df, cross_sectional)
+    df = standardize_date_shared_features(df, date_shared)
+    return df.sort_values([DATE_COL, ETF_COL]).reset_index(drop=True)
+
+
+# =============================================================================
+# Pooled design matrix (adds an ETF fixed effect)
+# =============================================================================
+
+def build_pooled_design_matrix(
+    df: pd.DataFrame,
+    feature_columns: list[str],
+    entity_categories: list[str],
+) -> pd.DataFrame:
+    """
+    Standardized features plus one-hot ETF dummies (one category dropped
+    as the reference level). `entity_categories` is fixed from the full
+    dataset (not just this fold), so train and test always share the same
+    dummy columns even if a fold happens to be missing an ETF.
+    """
+
+    entity = pd.Categorical(df[ETF_COL], categories=entity_categories)
+    dummies = pd.get_dummies(entity, prefix="ETF", drop_first=True).astype(float)
+    dummies.index = df.index
+
+    return pd.concat(
+        [df[feature_columns].reset_index(drop=True), dummies.reset_index(drop=True)],
+        axis=1,
+    )
+
+
+# =============================================================================
+# Walk-forward splits
+# =============================================================================
+
+def generate_walk_forward_splits(
+    df: pd.DataFrame,
+    config: ModelConfig,
+) -> list[WalkForwardSplit]:
+    unique_dates = pd.DatetimeIndex(sorted(pd.unique(df[DATE_COL])))
+    n_dates = len(unique_dates)
+    test_window_size = n_dates // (config.n_outer_splits + 1)
+
+    if test_window_size <= config.embargo_periods:
+        raise ValueError("Not enough dates for the requested splits and embargo.")
+
+    splits: list[WalkForwardSplit] = []
+
+    for split_number in range(config.n_outer_splits):
+        test_start = test_window_size * (split_number + 1)
+        test_end = (
+            n_dates
+            if split_number == config.n_outer_splits - 1
+            else test_start + test_window_size
+        )
+        train_end = test_start - config.embargo_periods
+
+        train_dates = unique_dates[:train_end]
+        test_dates = unique_dates[test_start:test_end]
+
+        train_index = df.index[df[DATE_COL].isin(train_dates)].to_numpy()
+        test_index = df.index[df[DATE_COL].isin(test_dates)].to_numpy()
+
+        if len(train_index) == 0 or len(test_index) == 0:
+            raise ValueError(f"Outer split {split_number + 1} is empty.")
+
+        splits.append(
+            WalkForwardSplit(
+                split_id=split_number + 1,
+                train_dates=train_dates,
+                test_dates=test_dates,
+                train_index=train_index,
+                test_index=test_index,
+            )
+        )
+
+    _check_no_split_leakage(splits)
+
+    return splits
+
+
+def _check_no_split_leakage(splits: list[WalkForwardSplit]) -> None:
+    """Safety net: no outer split should ever have a date on both sides."""
     for split in splits:
         overlap = set(split.train_dates) & set(split.test_dates)
         if overlap:
             raise AssertionError(
-                f"Split {split.split_id} has {len(overlap)} overlapping date(s) — embargo failed."
+                f"Outer split {split.split_id} has {len(overlap)} "
+                "date(s) on both the train and test side."
             )
- 
- 
-# =============================================================================
-# Baselines (no model fitting required)
-# =============================================================================
- 
-def no_skill_baseline(df: pd.DataFrame, random_state: int = 42) -> pd.Series:
-    """Random score per row — the floor a real model needs to clear."""
- 
-    rng = np.random.default_rng(random_state)
-    return pd.Series(rng.standard_normal(len(df)), index=df.index)
- 
- 
-def naive_momentum_baseline(df: pd.DataFrame, feature_col: str = "return_20d") -> pd.Series:
-    """Rank ETFs by an existing momentum feature directly — no fitting.
-    The check for whether the modeling complexity below is earning its
-    place."""
- 
-    return df[feature_col]
- 
- 
-# =============================================================================
-# Evaluation metrics
-# =============================================================================
- 
-def compute_cross_sectional_rank_ic(
-    df: pd.DataFrame,
-    pred_col: str,
-    target_col: str,
-    date_col: str = DATE_COL,
-) -> pd.Series:
-    """Spearman rank IC computed within each date's cross-section (across
-    the 11 ETFs that day). SECONDARY metric — see module docstring."""
- 
-    def _daily_ic(group: pd.DataFrame) -> float:
-        if group[pred_col].nunique() < 2 or group[target_col].nunique() < 2:
-            return np.nan
-        return group[pred_col].corr(group[target_col], method="spearman")
- 
-    ic_series = df.groupby(date_col)[[pred_col, target_col]].apply(_daily_ic)
-    ic_series.name = "rank_ic"
-    return ic_series.dropna()
- 
- 
-def compute_time_series_ic(
-    df: pd.DataFrame,
-    pred_col: str,
-    target_col: str,
-    entity_col: str = ENTITY_COL,
-) -> pd.Series:
-    """Spearman IC computed along TIME, separately per ETF — PRIMARY
-    metric. Each correlation uses ~n_dates observations instead of just
-    11, far less noisy given this project's small (N=11) universe."""
- 
-    def _entity_ic(group: pd.DataFrame) -> float:
-        if group[pred_col].nunique() < 2 or group[target_col].nunique() < 2:
-            return np.nan
-        return group[pred_col].corr(group[target_col], method="spearman")
- 
-    ts_ic = df.groupby(entity_col)[[pred_col, target_col]].apply(_entity_ic)
-    ts_ic.name = "time_series_ic"
-    return ts_ic.dropna()
- 
- 
-def compute_ic_ir(ic_series: pd.Series) -> dict:
-    """Descriptive mean/std/IC-IR summary without assuming independence."""
-
-    clean = pd.Series(ic_series).dropna().astype(float)
-    n = len(clean)
-    mean_ic = clean.mean() if n else np.nan
-    std_ic = clean.std(ddof=1) if n > 1 else np.nan
-    ic_ir = mean_ic / std_ic if n > 1 and std_ic > 0 else np.nan
-    return {"n_periods": n, "mean_ic": mean_ic, "std_ic": std_ic, "ic_ir": ic_ir}
 
 
-def compute_hac_mean_tstat(
-    ic_series: pd.Series,
-    max_lag: int = TARGET_HORIZON_DAYS - 1,
-) -> float:
-    """Newey-West/HAC t-stat for the mean of a serially correlated IC series."""
-
-    x = pd.Series(ic_series).dropna().astype(float).to_numpy()
-    n = len(x)
-    if n < 3:
-        return np.nan
-
-    demeaned = x - x.mean()
-    long_run_var = float(np.dot(demeaned, demeaned) / n)
-    lag_cap = min(max_lag, n - 1)
-
-    for lag in range(1, lag_cap + 1):
-        weight = 1.0 - lag / (lag_cap + 1.0)
-        gamma = float(np.dot(demeaned[lag:], demeaned[:-lag]) / n)
-        long_run_var += 2.0 * weight * gamma
-
-    if long_run_var <= 0:
-        return np.nan
-
-    return float(x.mean() / np.sqrt(long_run_var / n))
-
-
-def compute_hit_rate(df: pd.DataFrame, pred_col: str, target_col: str) -> float:
-    """Share of predictions with the correct sign, pooled across rows."""
- 
-    valid = df[[pred_col, target_col]].dropna()
-    correct_sign = np.sign(valid[pred_col]) == np.sign(valid[target_col])
-    return correct_sign.mean()
- 
- 
-def compute_hit_rate_by_entity(
-    df: pd.DataFrame,
-    pred_col: str,
-    target_col: str,
-    entity_col: str = ENTITY_COL,
-) -> pd.Series:
-    """Hit rate computed separately per ETF over time."""
- 
-    rates = df.groupby(entity_col)[[pred_col, target_col]].apply(
-        lambda g: compute_hit_rate(g, pred_col, target_col)
-    )
-    rates.name = "hit_rate"
-    return rates
- 
- 
-def compute_trivial_baseline_by_entity(
-    df: pd.DataFrame,
-    target_col: str,
-    entity_col: str = ENTITY_COL,
-) -> pd.Series:
-    """
-    The hit rate a trivial constant-sign prediction (always the majority
-    sign) would already achieve, per ETF. Hit rate is only a meaningful
-    skill measure relative to THIS, not to 0.5 — if the target's sign is
-    skewed (e.g. an ETF that rises more often than it falls from ordinary
-    market drift), a model that always predicts "up" scores a hit rate
-    equal to that base rate with zero real skill.
-    """
- 
-    rates = df.groupby(entity_col)[[target_col]].apply(
-        lambda g: max((g[target_col] > 0).mean(), (g[target_col] <= 0).mean())
-    )
-    rates.name = "trivial_baseline_hit_rate"
-    return rates
- 
- 
-def evaluate_predictions(
-    df: pd.DataFrame,
-    pred_col: str,
-    target_col: str = TARGET_COL,
-    date_col: str = DATE_COL,
-    entity_col: str = ENTITY_COL,
-) -> dict:
-    """
-    Full evaluation suite for a small (N=11) cross-section:
-      - PRIMARY: per-ETF time-series Spearman correlation, summarized across ETFs
-      - PRIMARY: hit rate, and its lift over the trivial base-rate baseline
-      - SECONDARY: cross-sectional rank IC, with explicit coverage
-    """
- 
-    valid = df.dropna(subset=[pred_col, target_col]).copy()
- 
-    ts_ic_by_etf = compute_time_series_ic(valid, pred_col, target_col, entity_col)
-    ts_ic_stats = compute_ic_ir(ts_ic_by_etf)
-    ts_cross_etf_t = (
-        ts_ic_stats["mean_ic"] / (ts_ic_stats["std_ic"] / np.sqrt(ts_ic_stats["n_periods"]))
-        if ts_ic_stats["n_periods"] > 1 and ts_ic_stats["std_ic"] > 0
-        else np.nan
-    )
- 
-    hit_rate_by_etf = compute_hit_rate_by_entity(valid, pred_col, target_col, entity_col)
-    trivial_by_etf = compute_trivial_baseline_by_entity(valid, target_col, entity_col)
-    hit_rate_lift_by_etf = (hit_rate_by_etf - trivial_by_etf).rename("hit_rate_lift")
- 
-    cs_ic_series = compute_cross_sectional_rank_ic(valid, pred_col, target_col, date_col)
-    cs_ic_stats = compute_ic_ir(cs_ic_series)
-    cs_ic_stats["hac_t_stat"] = compute_hac_mean_tstat(
-        cs_ic_series, max_lag=TARGET_HORIZON_DAYS - 1
-    )
-    cs_valid_dates = cs_ic_stats["n_periods"]
-    cs_total_dates = valid[date_col].nunique()
- 
-    return {
-        "n_obs": len(valid),
-        "time_series_ic": ts_ic_stats,
-        "time_series_ic_by_etf": ts_ic_by_etf,
-        "time_series_cross_etf_t_stat": ts_cross_etf_t,
-        "hit_rate_mean": hit_rate_by_etf.mean(),
-        "hit_rate_by_etf": hit_rate_by_etf,
-        "trivial_baseline_hit_rate_mean": trivial_by_etf.mean(),
-        "hit_rate_lift_mean": hit_rate_lift_by_etf.mean(),
-        "hit_rate_lift_by_etf": hit_rate_lift_by_etf,
-        "cross_sectional_ic": cs_ic_stats,
-        "cross_sectional_ic_total_dates": cs_total_dates,
-        "cross_sectional_ic_coverage": f"{cs_valid_dates}/{cs_total_dates} dates",
-    }
- 
- 
-def print_evaluation_summary(name: str, results: dict) -> None:
-    """Time-series metrics first (primary, N=11 universe); cross-sectional
-    IC reported second as a secondary diagnostic."""
- 
-    ts = results["time_series_ic"]
-    cs = results["cross_sectional_ic"]
- 
-    print(f"\n--- {name} ---")
-    print(f"n_obs (out-of-sample rows): {results['n_obs']}")
-    print(
-        "[PRIMARY] Mean per-ETF time-series Spearman correlation: "
-        f"mean={ts['mean_ic']:.4f}, std_across_ETFs={ts['std_ic']:.4f}, "
-        f"cross-ETF ratio={ts['ic_ir']:.4f} (n={ts['n_periods']} ETFs)"
-    )
-    print(
-        "          Descriptive cross-ETF t-stat "
-        "(not a time-series significance test): "
-        f"{results['time_series_cross_etf_t_stat']:.2f}"
-    )
-    print(
-        f"[PRIMARY] Hit rate: {results['hit_rate_mean']:.4f}  vs. trivial "
-        f"always-majority-sign baseline: {results['trivial_baseline_hit_rate_mean']:.4f}  "
-        f"-> lift = {results['hit_rate_lift_mean']:+.4f}"
-    )
-    print(
-        "[secondary] Cross-sectional rank IC: "
-        f"mean={cs['mean_ic']:.4f}, HAC t-stat={cs['hac_t_stat']:.2f} "
-        f"(valid on {results['cross_sectional_ic_coverage']}"
-        f"{' — degenerate on the remaining dates' if cs['n_periods'] < results['cross_sectional_ic_total_dates'] else ''})"
-    )
- 
- 
-# =============================================================================
-# Inner model-selection splits
-# =============================================================================
-
-
-def build_date_grouped_inner_cv(
+def generate_inner_time_splits(
     train_df: pd.DataFrame,
-    n_splits: int = 5,
-    embargo_days: int = EMBARGO_DAYS,
-    date_col: str = DATE_COL,
+    config: ModelConfig,
 ) -> list[tuple[np.ndarray, np.ndarray]]:
-    """Create inner CV indices by unique trading date, never by panel row."""
+    unique_dates = pd.DatetimeIndex(sorted(pd.unique(train_df[DATE_COL])))
+    validation_size = len(unique_dates) // (config.n_inner_splits + 1)
 
-    unique_dates = pd.DatetimeIndex(sorted(pd.unique(train_df[date_col])))
-    if len(unique_dates) <= n_splits + embargo_days + 1:
-        raise ValueError("Not enough unique dates for date-grouped inner CV.")
+    if validation_size <= config.embargo_periods:
+        raise ValueError("Not enough dates for inner CV and embargo.")
 
-    date_splitter = TimeSeriesSplit(n_splits=n_splits, gap=embargo_days)
-    row_dates = pd.to_datetime(train_df[date_col]).reset_index(drop=True)
+    row_dates = train_df[DATE_COL].reset_index(drop=True)
     folds: list[tuple[np.ndarray, np.ndarray]] = []
 
-    for train_date_idx, valid_date_idx in date_splitter.split(unique_dates):
-        inner_train_dates = unique_dates[train_date_idx]
-        inner_valid_dates = unique_dates[valid_date_idx]
-        train_rows = np.flatnonzero(row_dates.isin(inner_train_dates).to_numpy())
-        valid_rows = np.flatnonzero(row_dates.isin(inner_valid_dates).to_numpy())
-        folds.append((train_rows, valid_rows))
+    for split_number in range(config.n_inner_splits):
+        validation_start = validation_size * (split_number + 1)
+        validation_end = (
+            len(unique_dates)
+            if split_number == config.n_inner_splits - 1
+            else validation_start + validation_size
+        )
+        training_end = validation_start - config.embargo_periods
+
+        inner_train_dates = unique_dates[:training_end]
+        inner_validation_dates = unique_dates[validation_start:validation_end]
+
+        inner_train_rows = np.flatnonzero(
+            row_dates.isin(inner_train_dates).to_numpy()
+        )
+        inner_validation_rows = np.flatnonzero(
+            row_dates.isin(inner_validation_dates).to_numpy()
+        )
+
+        if len(inner_train_rows) == 0 or len(inner_validation_rows) == 0:
+            raise ValueError("An inner CV fold is empty.")
+
+        folds.append((inner_train_rows, inner_validation_rows))
 
     return folds
 
 
 # =============================================================================
-# Model 1: Penalized regression (Elastic Net) — pooled and specialized
+# Date-level cross-sectional IC tuning
 # =============================================================================
- 
-def fit_predict_elastic_net(
-    train_df: pd.DataFrame,
-    test_df: pd.DataFrame,
-    feature_cols: list[str],
-    entity_col: str,
-    target_col: str,
-) -> tuple[np.ndarray, pd.Series, float, float]:
-    """
-    Pooled Elastic Net across all 11 ETFs, with an ETF fixed effect
-    (dummy variables, one category dropped) so the model can capture a
-    per-sector level shift on top of the shared feature coefficients.
- 
-    Inner hyperparameter search uses embargoed TimeSeriesSplit (nested CV):
-    this is the INNER loop that only picks alpha/l1_ratio, nested inside
-    the OUTER walk-forward split that estimates unbiased performance.
-    The gap equals the target horizon to reduce overlap between training
-    labels and validation dates.
-    """
- 
-    train_df = train_df.sort_values(DATE_COL)
- 
-    train_dummies = pd.get_dummies(train_df[entity_col], prefix="ETF", drop_first=True).astype(float)
-    test_dummies = pd.get_dummies(test_df[entity_col], prefix="ETF", drop_first=True).astype(float)
-    test_dummies = test_dummies.reindex(columns=train_dummies.columns, fill_value=0.0)
- 
-    X_train = pd.concat(
-        [train_df[feature_cols].reset_index(drop=True), train_dummies.reset_index(drop=True)], axis=1
-    )
-    X_test = pd.concat(
-        [test_df[feature_cols].reset_index(drop=True), test_dummies.reset_index(drop=True)], axis=1
-    )
-    y_train = train_df[target_col].reset_index(drop=True)
- 
-    # Build the INNER CV folds from unique trading dates, not panel rows.
-    inner_cv = build_date_grouped_inner_cv(
-        train_df, n_splits=5, embargo_days=EMBARGO_DAYS
+
+def mean_daily_cross_sectional_ic(
+    dates: pd.Series,
+    actual: np.ndarray,
+    prediction: np.ndarray,
+) -> float:
+    scoring_df = pd.DataFrame(
+        {
+            DATE_COL: pd.to_datetime(dates).to_numpy(),
+            "actual": np.asarray(actual, dtype=float),
+            "prediction": np.asarray(prediction, dtype=float),
+        }
     )
 
-    model = ElasticNetCV(
-        # Balanced Elastic-Net-to-Lasso grid; no near-Ridge 0.01 setting.
-        l1_ratio=[0.20, 0.50, 0.80, 0.95, 1.00],
-        alphas=100,
-        eps=1e-3,
-        cv=inner_cv,
-        max_iter=50_000,
-        random_state=42,
-        n_jobs=-1,
-    )
-    model.fit(X_train, y_train)
-    preds = model.predict(X_test)
- 
-    coefs = pd.Series(model.coef_, index=X_train.columns)
-    coefs = coefs.reindex(coefs.abs().sort_values(ascending=False).index)
- 
-    return preds, coefs, model.alpha_, model.l1_ratio_
- 
- 
-def fit_predict_elastic_net_single(
-    train_df: pd.DataFrame,
-    test_df: pd.DataFrame,
-    feature_cols: list[str],
-    target_col: str,
-) -> np.ndarray:
-    """Same Elastic Net, minus the ETF dummies — only one entity in this
-    fit, used for the Step 2 specialized (per-ETF) comparison."""
- 
-    train_df = train_df.sort_values(DATE_COL)
-    X_train = train_df[feature_cols].reset_index(drop=True)
-    X_test = test_df[feature_cols].reset_index(drop=True)
-    y_train = train_df[target_col].reset_index(drop=True)
- 
-    inner_cv = build_date_grouped_inner_cv(
-        train_df, n_splits=5, embargo_days=EMBARGO_DAYS
-    )
-
-    model = ElasticNetCV(
-        # Same non-Ridge-like grid as the pooled model.
-        l1_ratio=[0.20, 0.50, 0.80, 0.95, 1.00],
-        alphas=100,
-        eps=1e-3,
-        cv=inner_cv,
-        max_iter=50_000,
-        random_state=42,
-        n_jobs=-1,
-    )
-    model.fit(X_train, y_train)
-    return model.predict(X_test)
- 
- 
-# =============================================================================
-# Model 2: Gradient boosting (LightGBM) — pooled and specialized
-# =============================================================================
- 
-def fit_predict_lightgbm(
-    train_df: pd.DataFrame,
-    test_df: pd.DataFrame,
-    feature_cols: list[str],
-    entity_col: str,
-    target_col: str,
-    n_estimators: int = 300,
-) -> tuple[np.ndarray, pd.Series]:
-    """
-    Pooled LightGBM, fit for a FIXED number of trees — no early stopping.
-
-    Early stopping was tried first (validation-based, on a held-out tail
-    slice of the training dates) and turned out to be badly unstable at
-    this data scale: across the 5 walk-forward folds, best_iteration_
-    landed at {4, 1, 67, 1, 1} — i.e. 4 of 5 folds effectively trained a
-    single tree before giving up, because the validation slice is small
-    and the per-round change in L2 loss is dominated by noise rather than
-    genuine improvement/overfitting. That instability made the reported
-    metric an artifact of which fold's validation slice happened to look
-    stable, not a genuine read on the model. A fixed, modest tree count
-    (matched to the num_leaves/min_child_samples regularization already
-    in place) is more reproducible across folds, at the cost of not
-    adapting tree count to each fold's data volume.
-    """
-
-    train_X = train_df[feature_cols + [entity_col]].copy()
-    test_X = test_df[feature_cols + [entity_col]].copy()
-
-    train_X[entity_col] = train_X[entity_col].astype("category")
-    test_X[entity_col] = pd.Categorical(test_X[entity_col], categories=train_X[entity_col].cat.categories)
-
-    model = lgb.LGBMRegressor(
-        n_estimators=n_estimators,
-        learning_rate=0.03,
-        num_leaves=15,
-        min_child_samples=50,
-        subsample=0.8,
-        subsample_freq=1,
-        colsample_bytree=0.8,
-        objective="regression",
-        random_state=42,
-        n_jobs=-1,
-        verbosity=-1,
-    )
-    model.fit(train_X, train_df[target_col], categorical_feature=[entity_col])
-    preds = model.predict(test_X)
-
-    importance = pd.Series(
-        model.feature_importances_, index=train_X.columns
-    ).sort_values(ascending=False)
-    importance.attrs["n_estimators"] = n_estimators
-    return preds, importance
-
-
-def fit_predict_lightgbm_single(
-    train_df: pd.DataFrame,
-    test_df: pd.DataFrame,
-    feature_cols: list[str],
-    target_col: str,
-    n_estimators: int = 300,
-) -> np.ndarray:
-    """Same fixed-tree-count LightGBM as fit_predict_lightgbm, minus the
-    ETF categorical — used for the Step 2 specialized (per-ETF) comparison."""
-
-    train_X = train_df[feature_cols].copy()
-    test_X = test_df[feature_cols].copy()
-
-    model = lgb.LGBMRegressor(
-        n_estimators=n_estimators,
-        learning_rate=0.03,
-        num_leaves=15,
-        min_child_samples=50,
-        subsample=0.8,
-        subsample_freq=1,
-        colsample_bytree=0.8,
-        objective="regression",
-        random_state=42,
-        n_jobs=-1,
-        verbosity=-1,
-    )
-    model.fit(train_X, train_df[target_col])
-    return model.predict(test_X)
-
-
-# =============================================================================
-# Fold-by-fold runners
-# =============================================================================
- 
-def run_walk_forward_models(
-    df: pd.DataFrame,
-    splits: list[WalkForwardSplit],
-    feature_cols: list[str],
-    entity_col: str = ENTITY_COL,
-    target_col: str = TARGET_COL,
-) -> tuple[pd.DataFrame, dict, dict]:
-    """Fit both POOLED models fold-by-fold and collect out-of-sample
-    predictions. Never re-uses a later fold's data to train an earlier
-    one."""
- 
-    test_frames, en_snapshots, lgb_snapshots = [], {}, {}
- 
-    for split in splits:
-        train_df, test_df = apply_split(df, split)
-        train_df = train_df.dropna(subset=feature_cols + [target_col])
-        test_df = test_df.dropna(subset=feature_cols + [target_col]).copy()
- 
-        if train_df.empty or test_df.empty:
+    daily_ics: list[float] = []
+    for _, group in scoring_df.groupby(DATE_COL):
+        if (
+            group["prediction"].nunique() < 2
+            or group["actual"].nunique() < 2
+        ):
             continue
- 
-        en_preds, en_coefs, alpha, l1_ratio = fit_predict_elastic_net(
-            train_df, test_df, feature_cols, entity_col, target_col
+
+        ic, _ = spearmanr(group["prediction"], group["actual"])
+        if np.isfinite(ic):
+            daily_ics.append(float(ic))
+
+    return float(np.mean(daily_ics)) if daily_ics else -1.0
+
+
+def build_elastic_net_pipeline(config: ModelConfig) -> Pipeline:
+    return Pipeline(
+        steps=[
+            ("imputer", SimpleImputer(strategy="median")),
+            ("scaler", StandardScaler()),
+            (
+                "model",
+                ElasticNet(
+                    max_iter=20_000,
+                    random_state=config.random_state,
+                ),
+            ),
+        ]
+    )
+
+
+def tune_elastic_net_by_daily_ic(
+    train_df: pd.DataFrame,
+    feature_columns: list[str],
+    target_column: str,
+    config: ModelConfig,
+    scoring_mode: str = "daily_cross_sectional_ic",
+    include_entity_dummies: bool = False,
+) -> tuple[Pipeline, dict, float, list[str]]:
+    train_df = train_df.sort_values([DATE_COL, ETF_COL]).reset_index(drop=True)
+
+    if include_entity_dummies:
+        X = build_pooled_design_matrix(
+            train_df, feature_columns, config.entity_categories
         )
-        lgb_preds, lgb_importance = fit_predict_lightgbm(
-            train_df, test_df, feature_cols, entity_col, target_col
-        )
- 
-        test_df["pred_elastic_net"] = en_preds
-        test_df["pred_lightgbm"] = lgb_preds
-        test_frames.append(test_df)
- 
-        en_snapshots[split.split_id] = {"alpha": alpha, "l1_ratio": l1_ratio, "coefs": en_coefs}
-        lgb_snapshots[split.split_id] = lgb_importance
- 
-    oos_df = pd.concat(test_frames, ignore_index=True)
-    return oos_df, en_snapshots, lgb_snapshots
- 
- 
-def run_walk_forward_models_specialized(
-    df: pd.DataFrame,
-    splits: list[WalkForwardSplit],
-    feature_cols: list[str],
-    entity_col: str = ENTITY_COL,
-    target_col: str = TARGET_COL,
+    else:
+        X = train_df[feature_columns]
+
+    y = train_df[target_column]
+    folds = generate_inner_time_splits(train_df, config)
+
+    best_score = -np.inf
+    best_params: dict | None = None
+
+    for params in ParameterGrid(ELASTIC_NET_PARAM_GRID):
+        fold_scores: list[float] = []
+
+        for train_rows, validation_rows in folds:
+            model = clone(build_elastic_net_pipeline(config))
+            model.set_params(**params)
+            model.fit(X.iloc[train_rows], y.iloc[train_rows])
+
+            validation_prediction = model.predict(X.iloc[validation_rows])
+
+            if scoring_mode == "daily_cross_sectional_ic":
+                fold_score = mean_daily_cross_sectional_ic(
+                    dates=train_df.iloc[validation_rows][DATE_COL],
+                    actual=y.iloc[validation_rows].to_numpy(),
+                    prediction=validation_prediction,
+                )
+            elif scoring_mode == "time_series_rank_ic":
+                y_validation = y.iloc[validation_rows].to_numpy()
+                if (
+                    np.unique(validation_prediction).size < 2
+                    or np.unique(y_validation).size < 2
+                ):
+                    fold_score = -1.0
+                else:
+                    fold_score, _ = spearmanr(
+                        validation_prediction,
+                        y_validation,
+                    )
+                    fold_score = (
+                        float(fold_score)
+                        if np.isfinite(fold_score)
+                        else -1.0
+                    )
+            else:
+                raise ValueError(
+                    "scoring_mode must be 'daily_cross_sectional_ic' "
+                    "or 'time_series_rank_ic'."
+                )
+
+            fold_scores.append(fold_score)
+
+        score = float(np.mean(fold_scores))
+        if score > best_score:
+            best_score = score
+            best_params = params
+
+    if best_params is None:
+        raise RuntimeError("Elastic Net hyperparameter search failed.")
+
+    final_model = build_elastic_net_pipeline(config)
+    final_model.set_params(**best_params)
+    final_model.fit(X, y)
+
+    return final_model, best_params, best_score, list(X.columns)
+
+
+# =============================================================================
+# Model fitting
+# =============================================================================
+
+def _prediction_frame(
+    test_df: pd.DataFrame,
+    prediction: np.ndarray,
+    target_column: str,
+    split_id: int,
+    model: str,
+    structure: str,
 ) -> pd.DataFrame:
-    """
-    Step 2 (Day 3): the 11 sector ETFs have genuinely different macro
-    sensitivities — pooling is a modeling CHOICE, not the only valid
-    default. Fits one independent Elastic Net + LightGBM per ETF, trained
-    only on that ETF's own history, on the same walk-forward folds as the
-    pooled version, so the two are directly comparable.
-    """
- 
-    test_frames = []
- 
-    for etf in sorted(df[entity_col].unique()):
-        etf_df = df[df[entity_col] == etf]
- 
-        for split in splits:
-            train_df, test_df = apply_split(etf_df, split)
-            train_df = train_df.dropna(subset=feature_cols + [target_col])
-            test_df = test_df.dropna(subset=feature_cols + [target_col]).copy()
- 
-            if len(train_df) < 100 or test_df.empty:
-                continue
- 
-            en_preds = fit_predict_elastic_net_single(train_df, test_df, feature_cols, target_col)
-            lgb_preds = fit_predict_lightgbm_single(train_df, test_df, feature_cols, target_col)
- 
-            test_df["pred_elastic_net_spec"] = en_preds
-            test_df["pred_lightgbm_spec"] = lgb_preds
-            test_frames.append(test_df)
- 
-    return pd.concat(test_frames, ignore_index=True)
- 
- 
-# =============================================================================
-# Run the modeling pipeline
-# =============================================================================
- 
-if __name__ == "__main__":
- 
-    if not FEATURE_DATA_PATH.exists():
-        raise FileNotFoundError(f"Feature dataset not found at: {FEATURE_DATA_PATH}. Run features.py first.")
- 
-    feature_df = pd.read_parquet(FEATURE_DATA_PATH)
-    print(f"Loaded feature dataset: {feature_df.shape}")
- 
-    print("\nFeature set (scope, Day 3 risk-model bucket):")
-    for feature_name, (scope, bucket) in FEATURE_GROUPS.items():
-        print(f"  {feature_name:22s} {scope:10s} {bucket}")
- 
-    # -------------------------------------------------------------------
-    # Walk-forward splits
-    # -------------------------------------------------------------------
- 
-    splits = generate_walk_forward_splits(
-        dates=feature_df[DATE_COL], n_splits=5, min_train_periods=500, embargo_days=EMBARGO_DAYS
-    )
- 
-    print(f"\nGenerated {len(splits)} walk-forward splits (embargo = {EMBARGO_DAYS} trading days):\n")
- 
-    test_frames = []
-    for split in splits:
-        train_df, test_df = apply_split(feature_df, split)
-        test_frames.append(test_df)
-        print(
-            f"Split {split.split_id}: train {split.train_dates[0].date()} -> {split.train_dates[-1].date()} "
-            f"({len(split.train_dates)} days)  |  embargo ({EMBARGO_DAYS}d)  |  "
-            f"test {split.test_dates[0].date()} -> {split.test_dates[-1].date()} ({len(split.test_dates)} days)"
-        )
- 
-    check_no_leakage(splits)
-    print("\nLeakage check passed: no train/test date overlap in any split.")
- 
-    # -------------------------------------------------------------------
-    # Baselines
-    # -------------------------------------------------------------------
- 
-    baseline_oos_df = pd.concat(test_frames, ignore_index=True)
-    baseline_oos_df["pred_no_skill"] = no_skill_baseline(baseline_oos_df)
-    baseline_oos_df["pred_naive_momentum"] = naive_momentum_baseline(baseline_oos_df, feature_col="return_20d")
- 
-    print("\n" + "=" * 70)
-    print("BASELINE EVALUATION (out-of-sample, all folds combined)")
-    print("=" * 70)
-    print_evaluation_summary("No-skill (random) baseline", evaluate_predictions(baseline_oos_df, "pred_no_skill"))
-    print_evaluation_summary(
-        "Naive momentum baseline (rank by return_20d)",
-        evaluate_predictions(baseline_oos_df, "pred_naive_momentum"),
-    )
- 
-    # -------------------------------------------------------------------
-    # Step 1: feature clustering diagnostics
-    # -------------------------------------------------------------------
- 
-    print("\n" + "=" * 70)
-    print("STEP 1 — FEATURE CLUSTERING / MULTICOLLINEARITY DIAGNOSTICS")
-    print("=" * 70)
- 
-    internal_corr = compute_feature_correlation_matrix(feature_df, INTERNAL_FEATURE_COLS)
-    print_high_correlation_pairs(internal_corr, threshold=0.7)
-    dropped = sorted(set(INTERNAL_FEATURE_COLS) - set(REDUCED_INTERNAL_FEATURE_COLS))
-    print(
-        f"\nDecision: reduce {len(INTERNAL_FEATURE_COLS)} internal features -> "
-        f"{len(REDUCED_INTERNAL_FEATURE_COLS)} (dropped: {dropped})"
-    )
- 
-    # -------------------------------------------------------------------
-    # Standardize once (point-in-time safe), then build both feature sets
-    # -------------------------------------------------------------------
- 
-    feature_df = add_cross_sectional_zscores(feature_df, INTERNAL_FEATURE_COLS)
-    feature_df = add_expanding_zscores(feature_df, EXTERNAL_FEATURE_COLS)
- 
-    full_feature_cols = [f"z_{c}" for c in INTERNAL_FEATURE_COLS] + [f"z_{c}" for c in EXTERNAL_FEATURE_COLS]
-    reduced_feature_cols = (
-        [f"z_{c}" for c in REDUCED_INTERNAL_FEATURE_COLS] + [f"z_{c}" for c in EXTERNAL_FEATURE_COLS]
-    )
- 
-    # -------------------------------------------------------------------
-    # Pooled models: full feature set vs. reduced (Step 1) feature set
-    # -------------------------------------------------------------------
- 
-    model_oos_df, en_snapshots, lgb_snapshots = run_walk_forward_models(feature_df, splits, full_feature_cols)
- 
-    print("\n" + "=" * 70)
-    print("MODEL EVALUATION — FULL feature set (12 internal + 6 external)")
-    print("=" * 70)
-    print_evaluation_summary("Elastic Net (full)", evaluate_predictions(model_oos_df, "pred_elastic_net"))
-    print_evaluation_summary("LightGBM (full)", evaluate_predictions(model_oos_df, "pred_lightgbm"))
- 
-    reduced_oos_df, en_snapshots_r, lgb_snapshots_r = run_walk_forward_models(
-        feature_df, splits, reduced_feature_cols
-    )
- 
-    print("\n" + "=" * 70)
-    print("MODEL EVALUATION — REDUCED feature set (7 internal + 6 external)")
-    print("=" * 70)
-    lgb_results_r = evaluate_predictions(reduced_oos_df, "pred_lightgbm")
-    print_evaluation_summary("Elastic Net (reduced)", evaluate_predictions(reduced_oos_df, "pred_elastic_net"))
-    print_evaluation_summary("LightGBM (reduced)", lgb_results_r)
- 
-    # -------------------------------------------------------------------
-    # Step 2: pooled vs. specialized (per-ETF), on the reduced feature set
-    # -------------------------------------------------------------------
- 
-    print("\n" + "=" * 70)
-    print("STEP 2 — POOLED vs. SPECIALIZED (per-ETF) MODELS")
-    print("=" * 70)
- 
-    specialized_oos_df = run_walk_forward_models_specialized(feature_df, splits, reduced_feature_cols)
-    lgb_results_spec = evaluate_predictions(specialized_oos_df, "pred_lightgbm_spec")
- 
-    print_evaluation_summary(
-        "Elastic Net (specialized, per-ETF)", evaluate_predictions(specialized_oos_df, "pred_elastic_net_spec")
-    )
-    print_evaluation_summary("LightGBM (specialized, per-ETF)", lgb_results_spec)
- 
-    print("\nPer-ETF time-series IC, pooled vs. specialized (LightGBM):")
-    comparison = pd.concat(
+    result = test_df[[DATE_COL, ETF_COL, target_column]].copy()
+    result = result.rename(columns={target_column: "actual"})
+    result["prediction"] = prediction
+    result["split_id"] = split_id
+    result["target_column"] = target_column
+    result["model"] = model
+    result["structure"] = structure
+    return result[
         [
-            lgb_results_r["time_series_ic_by_etf"].rename("pooled_ic"),
-            lgb_results_spec["time_series_ic_by_etf"].rename("specialized_ic"),
-        ],
-        axis=1,
+            DATE_COL,
+            ETF_COL,
+            "split_id",
+            "target_column",
+            "model",
+            "structure",
+            "actual",
+            "prediction",
+        ]
+    ]
+
+
+def fit_pooled_elastic_net(
+    train_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    target_column: str,
+    split_id: int,
+    config: ModelConfig,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    model, best_params, best_score, design_columns = tune_elastic_net_by_daily_ic(
+        train_df,
+        STANDARDIZED_FEATURE_COLUMNS,
+        target_column,
+        config,
+        include_entity_dummies=True,
     )
-    comparison["specialized_minus_pooled"] = comparison["specialized_ic"] - comparison["pooled_ic"]
-    print(comparison.sort_values("specialized_minus_pooled", ascending=False).round(4))
- 
-    # -------------------------------------------------------------------
-    # Feature diagnostics — most recent fold, reduced set
-    # -------------------------------------------------------------------
- 
-    last_split_id = splits[-1].split_id
- 
-    print("\n" + "=" * 70)
-    print(f"FEATURE DIAGNOSTICS — most recent fold (split {last_split_id}), reduced set")
-    print("=" * 70)
- 
-    en_last = en_snapshots_r[last_split_id]
-    print(f"\nElastic Net: alpha={en_last['alpha']:.5f}, l1_ratio={en_last['l1_ratio']}")
-    n_zeroed = (en_last["coefs"].abs() < 1e-8).sum()
-    print(f"Features zeroed out by the L1 penalty: {n_zeroed} / {len(en_last['coefs'])}")
-    print("Top 10 |coefficient|:")
-    print(en_last["coefs"].head(10))
- 
-    print("\nLightGBM gain-based feature importance (top 10):")
-    print(lgb_snapshots_r[last_split_id].head(10))
+
+    X_test = build_pooled_design_matrix(
+        test_df, STANDARDIZED_FEATURE_COLUMNS, config.entity_categories
+    )
+    prediction = model.predict(X_test)
+    pred_df = _prediction_frame(
+        test_df, prediction, target_column, split_id, "elastic_net", "pooled"
+    )
+
+    coefficients = pd.DataFrame(
+        {
+            "feature": design_columns,
+            "coefficient": model.named_steps["model"].coef_,
+        }
+    )
+    coefficients["selected"] = ~np.isclose(coefficients["coefficient"], 0.0)
+    coefficients["split_id"] = split_id
+    coefficients["target_column"] = target_column
+    coefficients["alpha"] = best_params["model__alpha"]
+    coefficients["l1_ratio"] = best_params["model__l1_ratio"]
+    coefficients["inner_cv_daily_cs_ic"] = best_score
+
+    if config.verbose:
+        print(
+            f"  Elastic Net pooled | alpha={best_params['model__alpha']:.6g} "
+            f"| l1_ratio={best_params['model__l1_ratio']:.2f} "
+            f"| inner daily CS IC={best_score:+.4f} "
+            f"| nonzero={int(coefficients['selected'].sum())}/{len(coefficients)}"
+        )
+
+    return pred_df, coefficients
+
+
+def fit_pooled_lightgbm(
+    train_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    target_column: str,
+    split_id: int,
+    config: ModelConfig,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    feature_cols_with_entity = STANDARDIZED_FEATURE_COLUMNS + [ETF_COL]
+    train_X = train_df[feature_cols_with_entity].copy()
+    test_X = test_df[feature_cols_with_entity].copy()
+
+    train_X[ETF_COL] = pd.Categorical(
+        train_X[ETF_COL], categories=config.entity_categories
+    )
+    test_X[ETF_COL] = pd.Categorical(
+        test_X[ETF_COL], categories=config.entity_categories
+    )
+
+    model = lgb.LGBMRegressor(
+        n_estimators=300,
+        learning_rate=0.03,
+        num_leaves=15,
+        min_child_samples=50,
+        subsample=0.8,
+        subsample_freq=1,
+        colsample_bytree=0.8,
+        objective="regression",
+        importance_type="gain",
+        random_state=config.random_state,
+        n_jobs=config.n_jobs,
+        verbosity=-1,
+    )
+
+    model.fit(
+        train_X,
+        train_df[target_column],
+        categorical_feature=[ETF_COL],
+    )
+    prediction = model.predict(test_X)
+
+    pred_df = _prediction_frame(
+        test_df, prediction, target_column, split_id, "lightgbm", "pooled"
+    )
+    importance = pd.DataFrame(
+        {
+            "feature": train_X.columns,
+            "gain_importance": model.feature_importances_,
+            "split_id": split_id,
+            "target_column": target_column,
+        }
+    )
+
+    return pred_df, importance
+
+
+def fit_specialized_models(
+    train_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    lgbm_train_df: pd.DataFrame,
+    lgbm_test_df: pd.DataFrame,
+    target_column: str,
+    split_id: int,
+    config: ModelConfig,
+) -> list[pd.DataFrame]:
+    """
+    `train_df`/`test_df` are the complete-case frames used by Elastic Net.
+    `lgbm_train_df`/`lgbm_test_df` only require a non-null target -- they
+    may still contain NaN features, which LightGBM handles natively, so
+    specialized LightGBM does not lose rows to Elastic Net's imputation
+    requirement (most relevant during the walk-forward warm-up window).
+    """
+
+    results: list[pd.DataFrame] = []
+
+    for etf in sorted(test_df[ETF_COL].unique()):
+        etf_train = train_df[train_df[ETF_COL] == etf].copy()
+        etf_test = test_df[test_df[ETF_COL] == etf].copy()
+
+        etf_lgbm_train = lgbm_train_df[lgbm_train_df[ETF_COL] == etf].copy()
+        etf_lgbm_test = lgbm_test_df[lgbm_test_df[ETF_COL] == etf].copy()
+
+        if etf_test.empty:
+            continue
+
+        if len(etf_train) < config.min_specialized_train_rows:
+            fallback = np.repeat(etf_train[target_column].mean(), len(etf_test))
+            results.append(
+                _prediction_frame(
+                    etf_test,
+                    fallback,
+                    target_column,
+                    split_id,
+                    "historical_mean",
+                    "specialized_fallback",
+                )
+            )
+            continue
+
+        # A single-ETF model has no cross-section within a date, so true
+        # date-level cross-sectional IC is mathematically undefined here.
+        # Specialized Elastic Net is therefore tuned on time-series rank IC.
+        en_model, _, _, _ = tune_elastic_net_by_daily_ic(
+            etf_train,
+            STANDARDIZED_FEATURE_COLUMNS,
+            target_column,
+            config,
+            scoring_mode="time_series_rank_ic",
+        )
+        en_prediction = en_model.predict(etf_test[STANDARDIZED_FEATURE_COLUMNS])
+        results.append(
+            _prediction_frame(
+                etf_test,
+                en_prediction,
+                target_column,
+                split_id,
+                "elastic_net",
+                "specialized",
+            )
+        )
+
+        if len(etf_lgbm_train) < config.min_specialized_train_rows or etf_lgbm_test.empty:
+            continue
+
+        lgb_model = lgb.LGBMRegressor(
+            n_estimators=300,
+            learning_rate=0.03,
+            num_leaves=15,
+            min_child_samples=30,
+            subsample=0.8,
+            subsample_freq=1,
+            colsample_bytree=0.8,
+            objective="regression",
+            random_state=config.random_state,
+            n_jobs=config.n_jobs,
+            verbosity=-1,
+        )
+        lgb_model.fit(
+            etf_lgbm_train[STANDARDIZED_FEATURE_COLUMNS],
+            etf_lgbm_train[target_column],
+        )
+        lgb_prediction = lgb_model.predict(
+            etf_lgbm_test[STANDARDIZED_FEATURE_COLUMNS]
+        )
+        results.append(
+            _prediction_frame(
+                etf_lgbm_test,
+                lgb_prediction,
+                target_column,
+                split_id,
+                "lightgbm",
+                "specialized",
+            )
+        )
+
+    return results
+
+
+def make_baselines(
+    train_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    target_column: str,
+    split_id: int,
+) -> list[pd.DataFrame]:
+    zero_prediction = np.zeros(len(test_df))
+    zero = _prediction_frame(
+        test_df,
+        zero_prediction,
+        target_column,
+        split_id,
+        "zero_return",
+        "baseline",
+    )
+
+    etf_means = train_df.groupby(ETF_COL)[target_column].mean()
+    global_mean = train_df[target_column].mean()
+    historical_prediction = (
+        test_df[ETF_COL].map(etf_means).fillna(global_mean).to_numpy()
+    )
+    historical = _prediction_frame(
+        test_df,
+        historical_prediction,
+        target_column,
+        split_id,
+        "historical_mean",
+        "baseline",
+    )
+
+    return [zero, historical]
+
+
+# =============================================================================
+# Evaluation
+# =============================================================================
+
+def compute_hac_mean_tstat(
+    series: pd.Series,
+    max_lag: int = TARGET_HORIZON_DAYS - 1,
+) -> float:
+    x = pd.Series(series).dropna().astype(float).to_numpy()
+    n = len(x)
+    if n < 3:
+        return np.nan
+
+    demeaned = x - x.mean()
+    long_run_variance = float(np.dot(demeaned, demeaned) / n)
+    lag_cap = min(max_lag, n - 1)
+
+    for lag in range(1, lag_cap + 1):
+        weight = 1.0 - lag / (lag_cap + 1.0)
+        covariance = float(np.dot(demeaned[lag:], demeaned[:-lag]) / n)
+        long_run_variance += 2.0 * weight * covariance
+
+    if long_run_variance <= 0:
+        return np.nan
+
+    return float(x.mean() / np.sqrt(long_run_variance / n))
+
+
+def daily_cross_sectional_ic(predictions: pd.DataFrame) -> pd.Series:
+    def _daily_ic(group: pd.DataFrame) -> float:
+        if (
+            group["prediction"].nunique() < 2
+            or group["actual"].nunique() < 2
+        ):
+            return np.nan
+        ic, _ = spearmanr(group["prediction"], group["actual"])
+        return float(ic) if np.isfinite(ic) else np.nan
+
+    result = predictions.groupby(DATE_COL).apply(
+        _daily_ic,
+        include_groups=False,
+    )
+    return result.dropna()
+
+
+def time_series_ic_by_etf(predictions: pd.DataFrame) -> pd.Series:
+    def _etf_ic(group: pd.DataFrame) -> float:
+        if (
+            group["prediction"].nunique() < 2
+            or group["actual"].nunique() < 2
+        ):
+            return np.nan
+        ic, _ = spearmanr(group["prediction"], group["actual"])
+        return float(ic) if np.isfinite(ic) else np.nan
+
+    return predictions.groupby(ETF_COL).apply(
+        _etf_ic,
+        include_groups=False,
+    ).dropna()
+
+
+def directional_metrics(predictions: pd.DataFrame) -> dict:
+    valid = predictions[["prediction", "actual"]].dropna().copy()
+
+    # A zero prediction is neutral, not a directional call.
+    directional = valid[~np.isclose(valid["prediction"], 0.0)].copy()
+    coverage = len(directional) / len(valid) if len(valid) else np.nan
+
+    if directional.empty:
+        accuracy = np.nan
+        predicted_positive_rate = np.nan
+    else:
+        accuracy = (
+            np.sign(directional["prediction"])
+            == np.sign(directional["actual"])
+        ).mean()
+        predicted_positive_rate = (directional["prediction"] > 0).mean()
+
+    return {
+        # Overall hit rate = sign accuracy across every observation on which
+        # the model makes a non-zero directional call. This is different from
+        # Hit@K, which evaluates only the top-ranked ETFs each date.
+        "overall_hit_rate": accuracy,
+        "directional_coverage": coverage,
+        "actual_positive_rate": (
+            (valid["actual"] > 0).mean() if len(valid) else np.nan
+        ),
+        "predicted_positive_rate": predicted_positive_rate,
+        "majority_sign_baseline": (
+            max((valid["actual"] > 0).mean(), (valid["actual"] < 0).mean())
+            if len(valid) else np.nan
+        ),
+    }
+
+
+def top_k_hit_rate(
+    predictions: pd.DataFrame,
+    k: int,
+) -> float:
+    daily_rates: list[float] = []
+
+    for _, group in predictions.groupby(DATE_COL):
+        if len(group) < k or group["prediction"].nunique() < 2:
+            continue
+
+        predicted_top = set(group.nlargest(k, "prediction")[ETF_COL])
+        actual_top = set(group.nlargest(k, "actual")[ETF_COL])
+        daily_rates.append(len(predicted_top & actual_top) / k)
+
+    return float(np.mean(daily_rates)) if daily_rates else np.nan
+
+
+def top_k_random_baseline(predictions: pd.DataFrame, k: int) -> float:
+    """
+    Expected Hit@K under random top-K selection: K / n_ETFs -- NOT 50%.
+    50% is only the right null for a balanced binary sign call; here the
+    question is "did my K picks overlap the actual top K out of n_ETFs."
+    """
+    n_entities = predictions[ETF_COL].nunique()
+    return k / n_entities if n_entities else np.nan
+
+
+def evaluate_predictions(predictions: pd.DataFrame) -> dict:
+    valid = predictions.dropna(subset=["actual", "prediction"]).copy()
+    error = valid["prediction"] - valid["actual"]
+
+    cs_ic = daily_cross_sectional_ic(valid)
+    ts_ic = time_series_ic_by_etf(valid)
+    direction = directional_metrics(valid)
+
+    denominator = float(
+        ((valid["actual"] - valid["actual"].mean()) ** 2).sum()
+    )
+    r_squared = (
+        1.0 - float((error ** 2).sum()) / denominator
+        if denominator > 0
+        else np.nan
+    )
+
+    overall_hit_rate_skill = (
+        direction["overall_hit_rate"] - direction["majority_sign_baseline"]
+        if np.isfinite(direction["overall_hit_rate"])
+        and np.isfinite(direction["majority_sign_baseline"])
+        else np.nan
+    )
+
+    hit_at_1 = top_k_hit_rate(valid, 1)
+    hit_at_3 = top_k_hit_rate(valid, 3)
+    hit_at_1_random = top_k_random_baseline(valid, 1)
+    hit_at_3_random = top_k_random_baseline(valid, 3)
+
+    return {
+        "n_obs": len(valid),
+        "rmse": float(np.sqrt(np.mean(error ** 2))),
+        "mae": float(np.mean(np.abs(error))),
+        "r_squared": r_squared,
+        "pearson_correlation": valid["prediction"].corr(valid["actual"]),
+        "mean_time_series_ic": ts_ic.mean(),
+        "n_time_series_ic_etfs": len(ts_ic),
+        "mean_daily_cross_sectional_ic": cs_ic.mean(),
+        "daily_cs_ic_hac_t_stat": compute_hac_mean_tstat(cs_ic),
+        "positive_daily_ic_rate": (cs_ic > 0).mean() if len(cs_ic) else np.nan,
+        "valid_daily_ic_dates": len(cs_ic),
+        "total_test_dates": valid[DATE_COL].nunique(),
+        "hit_rate_at_1": hit_at_1,
+        "hit_rate_at_1_random_baseline": hit_at_1_random,
+        "hit_rate_at_1_vs_random": (
+            hit_at_1 - hit_at_1_random
+            if np.isfinite(hit_at_1) and np.isfinite(hit_at_1_random)
+            else np.nan
+        ),
+        "hit_rate_at_3": hit_at_3,
+        "hit_rate_at_3_random_baseline": hit_at_3_random,
+        "hit_rate_at_3_vs_random": (
+            hit_at_3 - hit_at_3_random
+            if np.isfinite(hit_at_3) and np.isfinite(hit_at_3_random)
+            else np.nan
+        ),
+        "overall_hit_rate_skill_vs_majority": overall_hit_rate_skill,
+        **direction,
+    }
+
+
+def evaluate_all_models(predictions: pd.DataFrame) -> pd.DataFrame:
+    """Pooled-across-all-outer-folds evaluation: one row per
+    (target_column, model, structure)."""
+
+    records: list[dict] = []
+
+    group_columns = ["target_column", "model", "structure"]
+    for keys, group in predictions.groupby(group_columns, dropna=False):
+        target_column, model, structure = keys
+        record = {
+            "target_column": target_column,
+            "model": model,
+            "structure": structure,
+        }
+        record.update(evaluate_predictions(group))
+        records.append(record)
+
+    return pd.DataFrame(records).sort_values(group_columns).reset_index(drop=True)
+
+
+def evaluate_all_models_by_fold(predictions: pd.DataFrame) -> pd.DataFrame:
+    """
+    Same metrics as evaluate_all_models, but one row per
+    (target_column, model, structure, split_id) -- needed to check whether
+    a result like a marginally-significant HAC t-stat is stable across the
+    outer walk-forward folds or concentrated in just one or two of them.
+    """
+
+    records: list[dict] = []
+
+    group_columns = ["target_column", "model", "structure", "split_id"]
+    for keys, group in predictions.groupby(group_columns, dropna=False):
+        target_column, model, structure, split_id = keys
+        record = {
+            "target_column": target_column,
+            "model": model,
+            "structure": structure,
+            "split_id": split_id,
+        }
+        record.update(evaluate_predictions(group))
+        records.append(record)
+
+    return pd.DataFrame(records).sort_values(group_columns).reset_index(drop=True)
+
+
+# =============================================================================
+# Main runner
+# =============================================================================
+
+def main(verbose: bool = False) -> None:
+    config = ModelConfig(verbose=verbose)
+
+    df = load_feature_dataset()
+    validate_dataset(df, verbose=config.verbose)
+    df = prepare_model_dataset(df, verbose=config.verbose)
+
+    config.entity_categories = sorted(df[ETF_COL].unique().tolist())
+
+    splits = generate_walk_forward_splits(df, config)
+
+    prediction_frames: list[pd.DataFrame] = []
+    coefficient_frames: list[pd.DataFrame] = []
+    importance_frames: list[pd.DataFrame] = []
+
+    for target_column in TARGET_COLUMNS:
+        if config.verbose:
+            print("\n" + "=" * 78)
+            print(f"TARGET: {target_column}")
+            print("=" * 78)
+
+        target_df = df.dropna(subset=[target_column]).copy()
+
+        for split in splits:
+            raw_train_df = target_df.loc[
+                target_df.index.intersection(split.train_index)
+            ].copy()
+            raw_test_df = target_df.loc[
+                target_df.index.intersection(split.test_index)
+            ].copy()
+
+            # Elastic Net needs complete cases; LightGBM handles missing
+            # feature values natively and gets a more lenient frame below,
+            # so it does not lose rows Elastic Net has to drop.
+            train_df = raw_train_df.dropna(subset=STANDARDIZED_FEATURE_COLUMNS)
+            test_df = raw_test_df.dropna(subset=STANDARDIZED_FEATURE_COLUMNS)
+
+            lgbm_train_df = raw_train_df
+            lgbm_test_df = raw_test_df
+
+            if train_df.empty or test_df.empty:
+                continue
+
+            if config.verbose:
+                print(
+                    f"Split {split.split_id}: "
+                    f"train={train_df[DATE_COL].nunique()} dates, "
+                    f"test={test_df[DATE_COL].nunique()} dates"
+                )
+
+            prediction_frames.extend(
+                make_baselines(
+                    train_df, test_df, target_column, split.split_id
+                )
+            )
+
+            en_predictions, coefficients = fit_pooled_elastic_net(
+                train_df,
+                test_df,
+                target_column,
+                split.split_id,
+                config,
+            )
+            prediction_frames.append(en_predictions)
+            coefficient_frames.append(coefficients)
+
+            if not lgbm_train_df.empty and not lgbm_test_df.empty:
+                lgb_predictions, importance = fit_pooled_lightgbm(
+                    lgbm_train_df,
+                    lgbm_test_df,
+                    target_column,
+                    split.split_id,
+                    config,
+                )
+                prediction_frames.append(lgb_predictions)
+                importance_frames.append(importance)
+
+            prediction_frames.extend(
+                fit_specialized_models(
+                    train_df,
+                    test_df,
+                    lgbm_train_df,
+                    lgbm_test_df,
+                    target_column,
+                    split.split_id,
+                    config,
+                )
+            )
+
+    predictions = pd.concat(prediction_frames, ignore_index=True)
+    evaluation = evaluate_all_models(predictions)
+    evaluation_by_fold = evaluate_all_models_by_fold(predictions)
+
+    MODEL_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    prediction_path = MODEL_OUTPUT_DIR / "model_predictions.parquet"
+    evaluation_path = MODEL_OUTPUT_DIR / "model_evaluation.csv"
+    evaluation_by_fold_path = MODEL_OUTPUT_DIR / "model_evaluation_by_fold.csv"
+
+    predictions.to_parquet(prediction_path, index=False)
+    evaluation.to_csv(evaluation_path, index=False)
+    evaluation_by_fold.to_csv(evaluation_by_fold_path, index=False)
+
+    if coefficient_frames:
+        pd.concat(coefficient_frames, ignore_index=True).to_csv(
+            MODEL_OUTPUT_DIR / "elastic_net_coefficients.csv",
+            index=False,
+        )
+
+    if importance_frames:
+        pd.concat(importance_frames, ignore_index=True).to_csv(
+            MODEL_OUTPUT_DIR / "lightgbm_gain_importance.csv",
+            index=False,
+        )
+
+    if config.verbose:
+        print("\n" + "=" * 78)
+        print("FINAL EVALUATION (pooled across folds)")
+        print("=" * 78)
+        print(evaluation.to_string(index=False))
+
+    print(f"Saved predictions:          {prediction_path}")
+    print(f"Saved evaluation (overall): {evaluation_path}")
+    print(f"Saved evaluation (by fold): {evaluation_by_fold_path}")
+
+
+if __name__ == "__main__":
+    main()
