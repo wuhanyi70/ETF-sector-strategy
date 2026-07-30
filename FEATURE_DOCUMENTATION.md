@@ -46,5 +46,6 @@ Category: Internal/External. Bucket: Fundamental/Statistical/Macro.
 | `Yield_Spread_10Y2Y` | External | Macro | Business-cycle / recession signal |
 | `CPI` | External | Macro | Realized inflation (lagged) |
 | `Unemployment_Rate` | External | Macro | Labor market strength |
-| **Target** | | | |
-| `target_5d_forward_return` | Target | N/A | 5-day forward return (prediction target) |
+| **Targets (two candidates — final choice still to be decided)** | | | |
+| `target_5d_forward_return_raw` | Target | N/A | Raw 5-day forward return. Right default if the project's thesis is factor timing (systematic market swings ARE the signal being predicted). |
+| `target_5d_forward_return_excess_spy` | Target | N/A | 5-day forward return net of SPY's same-horizon return (factor-neutral proxy). Right default if the project's thesis is idiosyncratic-alpha (sector-specific mispricing, not a market call). |

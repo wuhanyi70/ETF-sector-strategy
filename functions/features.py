@@ -7,7 +7,9 @@ Tasks:
    excess), trend, risk, trading activity, technical indicators, and
    statistical factors.
 3. Compute external (exogenous) features: macro exposures.
-4. Compute the target variable (5-day forward return).
+4. Compute two candidate target variables (raw and factor-neutral
+   5-day forward return) — the choice between them is an open
+   modeling decision, so both are kept for now.
 5. Save the feature dataset with documentation.
 """
 
@@ -82,8 +84,20 @@ FEATURE_DOCUMENTATION = {
     "Yield_Spread_10Y2Y":         ("External", "Macro", "Business-cycle / recession signal"),
     "CPI":                        ("External", "Macro", "Realized inflation (lagged)"),
     "Unemployment_Rate":          ("External", "Macro", "Labor market strength"),
-    # Target
-    "target_5d_forward_return":   ("Target", "N/A", "5-day forward return (prediction target)"),
+    # Targets (two candidates — final choice still to be decided)
+    "target_5d_forward_return_raw": (
+        "Target", "N/A",
+        "Raw 5-day forward return. Right default if the project's "
+        "thesis is factor timing (systematic market swings ARE the "
+        "signal being predicted)."
+    ),
+    "target_5d_forward_return_excess_spy": (
+        "Target", "N/A",
+        "5-day forward return net of SPY's same-horizon return "
+        "(factor-neutral proxy). Right default if the project's "
+        "thesis is idiosyncratic-alpha (sector-specific mispricing, "
+        "not a market call)."
+    ),
 }
 
 
@@ -315,21 +329,50 @@ def add_rate_sensitivity_beta(df: pd.DataFrame, window: int = 60) -> pd.DataFram
 
 
 # =============================================================================
-# Target variable
+# Target variable(s)
 # =============================================================================
 
 def add_target_variable(df: pd.DataFrame, horizon: int = 5) -> pd.DataFrame:
     """
-    5-day forward return — the only place future information is
-    intentionally used, since this defines the prediction target
-    rather than a feature.
+    Two candidate targets, since the choice between "raw return" and
+    "factor-neutral return" is an undecided modeling choice (cf. Day 3
+    slide: "A Target Net of Factors: Predicting Clean Returns"). Both
+    are computed and kept so the modeling stage can compare them
+    empirically (e.g. via IC) before the final choice is locked in.
+
+    This is the only place future information is intentionally used,
+    since these define the prediction targets rather than features.
+
+    target_{h}d_forward_return_raw:
+        Raw forward return. The right default if the project's thesis
+        is factor timing — i.e. the systematic market swings ARE the
+        signal being predicted.
+
+    target_{h}d_forward_return_excess_spy:
+        Forward return net of SPY's same-horizon forward return — a
+        simple market-neutral proxy for the "factor-neutral" target.
+        The right default if the thesis is idiosyncratic-alpha
+        (sector-specific mispricing, not a market call).
     """
 
     df = df.copy()
-    df[f"target_{horizon}d_forward_return"] = (
+
+    raw_col = f"target_{horizon}d_forward_return_raw"
+    excess_col = f"target_{horizon}d_forward_return_excess_spy"
+
+    # Raw forward return
+    df[raw_col] = (
         df.groupby("ETF")["Adj_Close"]
         .transform(lambda x: x.shift(-horizon) / x - 1)
     )
+
+    # Factor-neutral (market-neutral) forward return: subtract SPY's
+    # forward return over the same horizon.
+    spy_forward_return = (
+        df.groupby("ETF")["SPY"]
+        .transform(lambda x: x.shift(-horizon) / x - 1)
+    )
+    df[excess_col] = df[raw_col] - spy_forward_return
 
     return df
 
@@ -357,7 +400,7 @@ def create_features(df: pd.DataFrame) -> pd.DataFrame:
     # External / Macro
     df = add_rate_sensitivity_beta(df)
 
-    # Target
+    # Targets (both candidates — final choice deferred to modeling stage)
     df = add_target_variable(df, horizon=5)
 
     df = df.sort_values(["Date", "ETF"]).reset_index(drop=True)
