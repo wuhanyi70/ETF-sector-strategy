@@ -11,6 +11,7 @@
 ---
 
 ## Project Overview
+
 The objective of this project is to predict the relative returns of the 11 SPDR Sector ETFs using market and macroeconomic information.
 
 The project follows a standard machine learning workflow:
@@ -29,6 +30,7 @@ The project follows a standard machine learning workflow:
 ETF-Sector-Rotation/
 │
 ├── README.md
+├── requirements.txt
 ├── .gitignore
 │
 ├── functions/
@@ -53,11 +55,15 @@ ETF-Sector-Rotation/
 
 | Source | Variables |
 |---------|-----------|
-| Yahoo Finance | Sector ETF OHLCV prices |
+| Yahoo Finance | 11 SPDR Sector ETF OHLCV prices |
+| Yahoo Finance | SPY (S&P 500 ETF) |
 | Yahoo Finance | CBOE Volatility Index (VIX) |
-| FRED | Federal Funds Rate |
+| FRED | Effective Federal Funds Rate |
+| FRED | 2-Year Treasury Yield |
 | FRED | 10-Year Treasury Yield |
 | FRED | 10Y–2Y Yield Spread |
+| FRED | 10-Year Breakeven Inflation Rate (T10YIE) |
+| FRED | National Financial Conditions Index (NFCI) |
 | FRED | Consumer Price Index (CPI) |
 | FRED | Unemployment Rate |
 
@@ -65,32 +71,18 @@ ETF-Sector-Rotation/
 
 ## Data Pipeline
 
-1. Download raw ETF price data.
-2. Download VIX data.
-3. Download macroeconomic data from FRED.
-4. Save raw datasets as CSV files.
-5. Merge all datasets into a single analysis-ready dataset.
-6. Export the cleaned dataset as a Parquet file.
+1. Download SPDR Sector ETF price data from Yahoo Finance.
+2. Download SPY data.
+3. Download VIX data.
+4. Download macroeconomic and market data from FRED.
+5. Save all raw datasets as CSV files.
+6. Clean and align datasets using point-in-time assumptions.
+7. Merge all datasets into a single analysis-ready dataset.
+8. Export the processed dataset as a Parquet file.
 
 ---
 
 ## Current Processing Decisions
-
-### Universe
-
-The strategy uses the following 11 SPDR sector ETFs:
-
-- XLB
-- XLC
-- XLE
-- XLF
-- XLI
-- XLK
-- XLP
-- XLRE
-- XLU
-- XLV
-- XLY
 
 ### Analysis Period
 
@@ -100,32 +92,36 @@ The analysis dataset begins on **2018-07-02**, after all 11 sector ETFs are avai
 
 ### Point-in-Time Assumptions
 
-To reduce look-ahead bias, monthly macroeconomic variables (e.g., CPI and unemployment rate) are shifted to the beginning of the following month before being merged with daily market data. This approximates the fact that these indicators are published after the period they measure.
+To reduce look-ahead bias, monthly macroeconomic variables (Federal Funds Rate, Consumer Price Index, and Unemployment Rate) are shifted to the beginning of the following month before being merged with daily market data. This approximates the delay between the observation period and public availability of these indicators.
 
-Daily Treasury and Federal Funds series remain on their original observation dates because they are available at daily frequency.
+Daily market variables (2-Year Treasury Yield, 10-Year Treasury Yield, 10Y–2Y Yield Spread, and 10-Year Breakeven Inflation Rate) remain on their original observation dates because they are assumed to be observable on those dates.
 
-Before merging, macroeconomic series are forward-filled between observation dates. The macro dataset is then merged with ETF trading data using a backward `merge_asof`, ensuring that each trading day is matched only with the most recently available macroeconomic information.
+The National Financial Conditions Index (NFCI) is released weekly and remains on its original observation dates. 
+
+Before merging, all macroeconomic series are forward-filled between observation dates. The macro dataset is then merged with ETF trading data using a backward `merge_asof`, ensuring that each trading day is matched only with the most recently available information.
 
 ---
 
 ## Reproducibility
 
-Install dependencies
+Install dependencies:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-Set your FRED API key
+Set your FRED API key:
 
 ```bash
 export FRED_API_KEY="YOUR_API_KEY"
 ```
 
-Run
+Run the data pipeline:
 
 ```bash
 python functions/data.py
 ```
+
+The script downloads all raw datasets, processes them, and exports the master dataset in Parquet format.
 
 ---

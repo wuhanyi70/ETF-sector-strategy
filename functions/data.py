@@ -3,10 +3,11 @@ Data sourcing and cleaning pipeline for the ETF Sector Rotation project.
 
 Tasks:
 1. Download 11 sector ETF price histories.
-2. Download VIX data.
-3. Download selected FRED macroeconomic indicators.
-4. Save raw datasets as CSV files.
-5. Clean, align, and merge the datasets.
+2. Download SPY data.
+3. Download VIX data.
+4. Download FRED macroeconomic indicators.
+5. Save raw datasets as CSV files.
+6. Clean, align, and merge the datasets.
 """
 
 import os
@@ -50,8 +51,11 @@ ETF_TICKERS = [
 
 FRED_SERIES = {
     "FEDFUNDS": "Federal_Funds_Rate",
+    "DGS2": "Treasury_2Y",
     "DGS10": "Treasury_10Y",
     "T10Y2Y": "Yield_Spread_10Y2Y",
+    "T10YIE": "Breakeven_Inflation_10Y",
+    "NFCI": "Financial_Conditions_Index",
     "CPIAUCSL": "CPI",
     "UNRATE": "Unemployment_Rate",
 }
@@ -126,6 +130,28 @@ def download_vix_data(
     return data
 
 
+
+def download_spy_data(
+    start_date: str,
+    end_date: str,
+) -> pd.DataFrame:
+    """Download daily SPY data from Yahoo Finance."""
+
+    data = yf.download(
+        tickers="SPY",
+        start=start_date,
+        end=end_date,
+        interval="1d",
+        auto_adjust=False,
+        progress=True,
+    )
+
+    if data.empty:
+        raise RuntimeError("SPY download returned no data.")
+
+    return data
+
+
 def download_fred_data(
     api_key: str,
     series_dict: dict[str, str],
@@ -169,13 +195,14 @@ def download_fred_data(
 
 def create_master_dataset(
     etf_data: pd.DataFrame,
+    spy_data: pd.DataFrame,
     vix_data: pd.DataFrame,
     macro_data: pd.DataFrame,
     tickers: list[str],
     analysis_start_date: str,
 ) -> pd.DataFrame:
     """
-    Convert ETF data to long format and merge VIX and macroeconomic data.
+    Convert ETF data to long format and merge SPY, VIX, and macro data.
 
     Each output row represents one ETF on one trading date.
     """
@@ -222,7 +249,29 @@ def create_master_dataset(
         )
 
     # -------------------------------------------------------------------------
-    # 2. Prepare and merge VIX closing values
+    # 2. Prepare and merge SPY benchmark values
+    # -------------------------------------------------------------------------
+
+    if isinstance(spy_data.columns, pd.MultiIndex):
+        spy_adj_close = spy_data["Adj Close"].copy()
+
+        if isinstance(spy_adj_close, pd.DataFrame):
+            spy_adj_close = spy_adj_close.iloc[:, 0]
+    else:
+        spy_adj_close = spy_data["Adj Close"].copy()
+
+    spy_clean = spy_adj_close.rename("SPY").reset_index()
+    spy_clean["Date"] = pd.to_datetime(spy_clean["Date"])
+
+    master_data = etf_long.merge(
+        spy_clean,
+        on="Date",
+        how="left",
+        validate="many_to_one",
+    )
+
+    # -------------------------------------------------------------------------
+    # 3. Prepare and merge VIX closing values
     # -------------------------------------------------------------------------
 
     if isinstance(vix_data.columns, pd.MultiIndex):
@@ -236,7 +285,7 @@ def create_master_dataset(
     vix_clean = vix_close.rename("VIX").reset_index()
     vix_clean["Date"] = pd.to_datetime(vix_clean["Date"])
 
-    master_data = etf_long.merge(
+    master_data = master_data.merge(
         vix_clean,
         on="Date",
         how="left",
@@ -244,7 +293,7 @@ def create_master_dataset(
     )
 
     # -------------------------------------------------------------------------
-    # 3. Prepare macroeconomic data
+    # 4. Prepare macroeconomic data
     # -------------------------------------------------------------------------
 
     macro_clean = macro_data.copy()
@@ -257,12 +306,17 @@ def create_master_dataset(
         "Unemployment_Rate",
     ]
 
-    daily_columns = [
+    market_macro_columns = [
+        "Treasury_2Y",
         "Treasury_10Y",
         "Yield_Spread_10Y2Y",
+        "Breakeven_Inflation_10Y",
+        "Financial_Conditions_Index",
     ]
 
-    required_macro_columns = set(monthly_columns + daily_columns)
+    required_macro_columns = set(
+        monthly_columns + market_macro_columns
+    )
     missing_macro_columns = required_macro_columns - set(macro_clean.columns)
 
     if missing_macro_columns:
@@ -285,25 +339,26 @@ def create_master_dataset(
         + pd.Timedelta(days=1)
     )
 
-    daily_macro = (
-        macro_clean[daily_columns]
+    market_macro = (
+        macro_clean[market_macro_columns]
         .dropna(how="all")
         .copy()
     )
 
     macro_clean = pd.concat(
-        [daily_macro, monthly_macro],
+        [market_macro, monthly_macro],
         axis=1,
     ).sort_index()
 
     # Carry each latest available macro value forward.
+    # This also carries the weekly NFCI value between releases.
     macro_clean = macro_clean.ffill()
 
     macro_clean.index.name = "Date"
     macro_clean = macro_clean.reset_index()
 
     # -------------------------------------------------------------------------
-    # 4. Match each trading date with the latest macro observations
+    # 5. Match each trading date with the latest macro observations
     # -------------------------------------------------------------------------
 
     master_data = master_data.sort_values("Date")
@@ -317,7 +372,7 @@ def create_master_dataset(
     )
 
     # -------------------------------------------------------------------------
-    # 5. Keep the balanced period when all 11 ETFs are available
+    # 6. Keep the balanced period when all 11 ETFs are available
     # -------------------------------------------------------------------------
 
     master_data = master_data[
@@ -332,6 +387,8 @@ def create_master_dataset(
             "Close",
             "Adj_Close",
             "Volume",
+            "SPY",
+            "VIX",
         ]
     )
 
@@ -374,6 +431,17 @@ if __name__ == "__main__":
     print(f"Saved raw ETF data to: {etf_output_path}")
     print(f"Raw ETF dataset shape: {etf_data.shape}")
 
+    spy_data = download_spy_data(
+        start_date=START_DATE,
+        end_date=END_DATE,
+    )
+
+    spy_output_path = RAW_DATA_DIR / "spy.csv"
+    spy_data.to_csv(spy_output_path)
+
+    print(f"Saved raw SPY data to: {spy_output_path}")
+    print(f"Raw SPY dataset shape: {spy_data.shape}")
+
     vix_data = download_vix_data(
         start_date=START_DATE,
         end_date=END_DATE,
@@ -407,6 +475,7 @@ if __name__ == "__main__":
 
     master_data = create_master_dataset(
         etf_data=etf_data,
+        spy_data=spy_data,
         vix_data=vix_data,
         macro_data=macro_data,
         tickers=ETF_TICKERS,
