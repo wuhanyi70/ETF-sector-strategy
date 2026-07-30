@@ -170,3 +170,64 @@ if __name__ == "__main__":
         f"variance: {n_for_90pct} (out of {len(results['feature_columns'])} "
         f"total features)"
     )
+
+
+"""
+Final selected feature list for the ETF Sector Rotation project,
+after PCA-based redundancy screening (see docs/pca_feature_diagnostic.md
+for the full analysis and rationale behind each inclusion/exclusion).
+
+33 candidate features -> 28 selected features.
+"""
+
+SELECTED_FEATURES = [
+    # --- Internal / Fundamental: Returns (raw / relative / excess) ---
+    "return_5d",
+    "return_5d_rel_spy",
+    "return_5d_excess_rf",
+    "return_20d",
+    "return_20d_rel_spy",
+    "return_20d_excess_rf",
+    "return_60d_rel_spy",
+
+    # --- Internal / Fundamental: Trend ---
+    "price_to_MA20",
+    "price_to_MA50",
+    "MA20_minus_MA50",
+
+    # --- Internal / Fundamental: Risk ---
+    "volatility_20d",
+    "max_drawdown_60d",
+    "ATR_14",
+
+    # --- Internal / Fundamental: Trading activity ---
+    "volume_change",
+    "relative_volume",
+
+    # --- Internal / Fundamental: Technical ---
+    "RSI_14",
+
+    # --- Internal / Statistical ---
+    "market_beta_60d",
+    "idio_vol_60d",
+
+    # --- External / Macro ---
+    "Federal_Funds_Rate",
+    "Treasury_10Y",
+    "Yield_Spread_10Y2Y",
+    "Breakeven_Inflation_10Y",
+    "CPI",
+    "Unemployment_Rate",
+    "Financial_Conditions_Index",
+    "VIX",
+    "rate_sensitivity_beta",
+]
+
+# Dropped as redundant (see pca_feature_diagnostic.md for rationale):
+# MA20, MA50, MACD, return_60d, return_60d_excess_rf, Treasury_2Y
+
+# Targets are kept separately, NOT part of SELECTED_FEATURES:
+TARGET_COLUMNS = [
+    "target_5d_forward_return_raw",
+    "target_5d_forward_return_excess_spy",
+]
