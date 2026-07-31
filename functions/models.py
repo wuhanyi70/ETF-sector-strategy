@@ -649,16 +649,20 @@ def fit_specialized_models(
     target_column: str,
     split_id: int,
     config: ModelConfig,
-) -> list[pd.DataFrame]:
+) -> tuple[list[pd.DataFrame], list[pd.DataFrame], list[pd.DataFrame]]:
     """
     `train_df`/`test_df` are the complete-case frames used by Elastic Net.
     `lgbm_train_df`/`lgbm_test_df` only require a non-null target -- they
     may still contain NaN features, which LightGBM handles natively, so
     specialized LightGBM does not lose rows to Elastic Net's imputation
     requirement (most relevant during the walk-forward warm-up window).
+
+    Returns (prediction_frames, en_coefficient_frames, lgbm_importance_frames).
     """
 
-    results: list[pd.DataFrame] = []
+    prediction_frames: list[pd.DataFrame] = []
+    en_coefficient_frames: list[pd.DataFrame] = []
+    lgbm_importance_frames: list[pd.DataFrame] = []
 
     for etf in sorted(test_df[ETF_COL].unique()):
         etf_train = train_df[train_df[ETF_COL] == etf].copy()
@@ -672,7 +676,7 @@ def fit_specialized_models(
 
         if len(etf_train) < config.min_specialized_train_rows:
             fallback = np.repeat(etf_train[target_column].mean(), len(etf_test))
-            results.append(
+            prediction_frames.append(
                 _prediction_frame(
                     etf_test,
                     fallback,
@@ -684,18 +688,17 @@ def fit_specialized_models(
             )
             continue
 
-        # A single-ETF model has no cross-section within a date, so true
-        # date-level cross-sectional IC is mathematically undefined here.
-        # Specialized Elastic Net is therefore tuned on time-series rank IC.
-        en_model, _, _, _ = tune_elastic_net_by_daily_ic(
-            etf_train,
-            STANDARDIZED_FEATURE_COLUMNS,
-            target_column,
-            config,
-            scoring_mode="time_series_rank_ic",
+        en_model, en_best_params, en_best_score, en_design_columns = (
+            tune_elastic_net_by_daily_ic(
+                etf_train,
+                STANDARDIZED_FEATURE_COLUMNS,
+                target_column,
+                config,
+                scoring_mode="time_series_rank_ic",
+            )
         )
         en_prediction = en_model.predict(etf_test[STANDARDIZED_FEATURE_COLUMNS])
-        results.append(
+        prediction_frames.append(
             _prediction_frame(
                 etf_test,
                 en_prediction,
@@ -705,6 +708,21 @@ def fit_specialized_models(
                 "specialized",
             )
         )
+
+        en_coefs = pd.DataFrame(
+            {
+                "feature": en_design_columns,
+                "coefficient": en_model.named_steps["model"].coef_,
+            }
+        )
+        en_coefs["selected"] = ~np.isclose(en_coefs["coefficient"], 0.0)
+        en_coefs["etf"] = etf
+        en_coefs["split_id"] = split_id
+        en_coefs["target_column"] = target_column
+        en_coefs["alpha"] = en_best_params["model__alpha"]
+        en_coefs["l1_ratio"] = en_best_params["model__l1_ratio"]
+        en_coefs["inner_cv_time_series_rank_ic"] = en_best_score
+        en_coefficient_frames.append(en_coefs)
 
         if len(etf_lgbm_train) < config.min_specialized_train_rows or etf_lgbm_test.empty:
             continue
@@ -729,7 +747,7 @@ def fit_specialized_models(
         lgb_prediction = lgb_model.predict(
             etf_lgbm_test[STANDARDIZED_FEATURE_COLUMNS]
         )
-        results.append(
+        prediction_frames.append(
             _prediction_frame(
                 etf_lgbm_test,
                 lgb_prediction,
@@ -740,7 +758,18 @@ def fit_specialized_models(
             )
         )
 
-    return results
+        lgb_importance = pd.DataFrame(
+            {
+                "feature": STANDARDIZED_FEATURE_COLUMNS,
+                "gain_importance": lgb_model.feature_importances_,
+            }
+        )
+        lgb_importance["etf"] = etf
+        lgb_importance["split_id"] = split_id
+        lgb_importance["target_column"] = target_column
+        lgbm_importance_frames.append(lgb_importance)
+
+    return prediction_frames, en_coefficient_frames, lgbm_importance_frames
 
 
 def make_baselines(
@@ -1022,6 +1051,8 @@ def main(verbose: bool = False) -> None:
     prediction_frames: list[pd.DataFrame] = []
     coefficient_frames: list[pd.DataFrame] = []
     importance_frames: list[pd.DataFrame] = []
+    specialized_coefficient_frames: list[pd.DataFrame] = []
+    specialized_importance_frames: list[pd.DataFrame] = []
 
     for target_column in TARGET_COLUMNS:
         if config.verbose:
@@ -1085,17 +1116,22 @@ def main(verbose: bool = False) -> None:
                 prediction_frames.append(lgb_predictions)
                 importance_frames.append(importance)
 
-            prediction_frames.extend(
-                fit_specialized_models(
-                    train_df,
-                    test_df,
-                    lgbm_train_df,
-                    lgbm_test_df,
-                    target_column,
-                    split.split_id,
-                    config,
-                )
+            (
+                specialized_predictions,
+                specialized_en_coefs,
+                specialized_lgb_importance,
+            ) = fit_specialized_models(
+                train_df,
+                test_df,
+                lgbm_train_df,
+                lgbm_test_df,
+                target_column,
+                split.split_id,
+                config,
             )
+            prediction_frames.extend(specialized_predictions)
+            specialized_coefficient_frames.extend(specialized_en_coefs)
+            specialized_importance_frames.extend(specialized_lgb_importance)
 
     predictions = pd.concat(prediction_frames, ignore_index=True)
     evaluation = evaluate_all_models(predictions)
@@ -1122,6 +1158,18 @@ def main(verbose: bool = False) -> None:
             index=False,
         )
 
+    if specialized_coefficient_frames:
+        pd.concat(specialized_coefficient_frames, ignore_index=True).to_csv(
+            MODEL_OUTPUT_DIR / "elastic_net_coefficients_specialized.csv",
+            index=False,
+        )
+
+    if specialized_importance_frames:
+        pd.concat(specialized_importance_frames, ignore_index=True).to_csv(
+            MODEL_OUTPUT_DIR / "lightgbm_gain_importance_specialized.csv",
+            index=False,
+        )
+    
     if config.verbose:
         print("\n" + "=" * 78)
         print("FINAL EVALUATION (pooled across folds)")
