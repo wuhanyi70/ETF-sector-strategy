@@ -8,6 +8,22 @@ Tasks:
 4. Download FRED macroeconomic indicators.
 5. Save raw datasets as CSV files.
 6. Clean, align, and merge the datasets.
+
+
+Point-in-Time Assumptions
+
+To reduce look-ahead bias, monthly macroeconomic variables (Federal Funds Rate, Consumer Price Index, and Unemployment Rate) are 
+shifted to the beginning of the following month before being merged with daily market data. This approximates the delay between the 
+observation period and public availability of these indicators.
+
+Daily market variables (2-Year Treasury Yield, 10-Year Treasury Yield, 10Y–2Y Yield Spread, and 10-Year Breakeven Inflation Rate) 
+remain on their original observation dates because they are assumed to be observable on those dates.
+
+The National Financial Conditions Index (NFCI) is released weekly and remains on its original observation dates. 
+
+Before merging, all macroeconomic series are forward-filled between observation dates. The macro dataset is then merged with ETF 
+trading data using a backward `merge_asof`, ensuring that each trading day is matched only with the most recently available information.
+
 """
 
 import os

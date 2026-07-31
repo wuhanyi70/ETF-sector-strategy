@@ -27,31 +27,30 @@ The project follows a standard machine learning workflow:
 ## Project Structure
 
 ```
-ETF-Sector-Rotation/
-│
-├── README.md
-├── requirements.txt
-├── .gitignore
+ETF-Sector-Strategy/
 │
 ├── functions/
 │   ├── data.py
 │   ├── features.py
+│   ├── feature_pca.py
 │   ├── models.py
-│   └── portfolio.py
+│   ├── portfolio.py
+│   ├── reporting.py
+│   └── residual_diagnostics.py
 │
 ├── data/
 │   ├── raw/
-│   └── processed/
+│   ├── processed/
+│   └── model_outputs/
 │
-├── outputs/
-│   ├── figures/
-│   └── tables/
-│
-└── main.ipynb
+├── README.md
+├── FEATURE_DOCUMENTATION.md
+├── requirements.txt
+└── .gitignore
 ```
 ---
 
-## Data Sources
+## Raw Data
 
 | Source | Variables |
 |---------|-----------|
@@ -69,36 +68,11 @@ ETF-Sector-Rotation/
 
 ---
 
-## Data Pipeline
-
-1. Download SPDR Sector ETF price data from Yahoo Finance.
-2. Download SPY data.
-3. Download VIX data.
-4. Download macroeconomic and market data from FRED.
-5. Save all raw datasets as CSV files.
-6. Clean and align datasets using point-in-time assumptions.
-7. Merge all datasets into a single analysis-ready dataset.
-8. Export the processed dataset as a Parquet file.
-
----
-
-## Current Processing Decisions
-
-### Analysis Period
+## Analysis Period
 
 Raw data begins on **2018-06-01**.
 
-The analysis dataset begins on **2018-07-02**, after all 11 sector ETFs are available.
-
-### Point-in-Time Assumptions
-
-To reduce look-ahead bias, monthly macroeconomic variables (Federal Funds Rate, Consumer Price Index, and Unemployment Rate) are shifted to the beginning of the following month before being merged with daily market data. This approximates the delay between the observation period and public availability of these indicators.
-
-Daily market variables (2-Year Treasury Yield, 10-Year Treasury Yield, 10Y–2Y Yield Spread, and 10-Year Breakeven Inflation Rate) remain on their original observation dates because they are assumed to be observable on those dates.
-
-The National Financial Conditions Index (NFCI) is released weekly and remains on its original observation dates. 
-
-Before merging, all macroeconomic series are forward-filled between observation dates. The macro dataset is then merged with ETF trading data using a backward `merge_asof`, ensuring that each trading day is matched only with the most recently available information.
+The analysis dataset begins on **2018-07-02**, after all 11 sector ETFs are available, and extends to **2026-06-30**.
 
 ---
 
@@ -120,8 +94,11 @@ Run the data pipeline:
 
 ```bash
 python functions/data.py
+python functions/features.py
+python functions/feature_pca.py
+python functions/models.py
+python functions/portfolio.py
+python functions/reporting.py
+python functions/residual_diagnostics.py
 ```
-
-The script downloads all raw datasets, processes them, and exports the master dataset in Parquet format.
-
 ---
